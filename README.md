@@ -34,6 +34,13 @@ The resulting `./screengrab` is a self-contained binary. On macOS arm64 it is ar
 
 # Faster sampling, secondary display
 ./screengrab --duration 4s --fps 4 --display 1 --output clip
+
+# Discover capturable sources (displays + macOS windows, incl. maximized apps
+# on inactive Spaces that normally need a swipe to reach)
+./screengrab --list-sources
+
+# Record a single macOS window by its ID from --list-sources
+./screengrab --duration 4s --source window:0x21cb --output window-clip
 ```
 
 ## Flags
@@ -44,10 +51,27 @@ The resulting `./screengrab` is a self-contained binary. On macOS arm64 it is ar
 | `--duration` | `0` (run until Ctrl+C) | Max recording duration, e.g. `10s`, `1m`, `90s`. When set, exactly `round(fps * seconds)` frames are captured. |
 | `--output` | `screengrab-out` | Output directory (created if missing). |
 | `--mode` | `frames` | `frames` writes one PNG per capture; `spritesheet` writes one composite PNG plus `spritesheet.json`. |
-| `--display` | `0` | Display index. `0` is the primary display. |
+| `--display` | `0` | Display index. `0` is the primary display. Kept as a shorthand for `--source display:N`. |
+| `--source` | (unset) | Explicit capture source: `display:N` for a physical display, or `window:0xID` for a macOS window (run `--list-sources` to get the IDs). Overrides `--display` when present. |
+| `--list-sources` | `false` | Print every capturable source (displays and macOS windows) and exit. |
 | `--cols` | `0` (auto) | Columns in spritesheet grid; defaults to `ceil(sqrt(frame_count))`. |
+| `--gui` | `false` | Launch the cross-platform desktop GUI instead of the headless CLI flow. |
+| `--devtools` | `false` | Open the webview developer tools panel when `--gui` is set. |
 
 `Ctrl+C` (SIGINT) and SIGTERM stop a long-running capture cleanly and flush any frames already captured.
+
+## Desktop GUI
+
+Run `./screengrab --gui` to open the desktop view, powered by [Wails v3](https://v3.wails.io). The Go side opens an OS-native webview; on macOS 26+ the window itself is backed by `NSGlassEffectView` (real Apple Liquid Glass), falling back to `NSVisualEffectView` on earlier macOS. On Windows and Linux the webview is opaque and the matching CSS Liquid Glass recipe in `frontend/style.css` carries the look.
+
+The flow is:
+
+1. **Setup**: pick a capture source from the dropdown — the list is grouped into *Displays* (physical screens) and *Windowed apps*, where each window is labelled with its owning application. A maximized macOS app on its own Space appears in the windowed-apps group, so you can record it without having to swipe over there first. Then set the FPS, set the output base directory, and either *Pick Region* to drag a rectangle on a preview of the source, or *Use Full Source*.
+2. **Recording**: click *Start Recording*; the GUI captures at the configured FPS into a timestamped sub-directory of the output base. Press *Stop Recording* when done.
+3. **Review**: every captured frame appears as a thumbnail in a grid. Click to toggle selection, or use *Select All* / *Clear*.
+4. **Save**: click *Save Selected & Copy Path*. The selected frames are copied to a new `selected-YYYYMMDD-HHMMSS/` sub-directory and the absolute path is written to the system clipboard for pasting into your next tool (e.g. an LLM chat).
+
+The GUI shares the same `captureSource` / `captureSourceRegion` primitives as the CLI; flags like `--display`, `--fps`, and `--output` are honoured as initial values and can be edited live in the setup screen. Pass `--devtools` if you need to open the webview developer panel.
 
 ## Output
 
@@ -92,9 +116,22 @@ Use the metadata to slice the sheet back into frames programmatically. Frames ar
 
 The first time you run `screengrab`, macOS will prompt for Screen Recording permission under **System Settings → Privacy & Security → Screen Recording**. Grant it to your terminal app (Terminal, iTerm2, Ghostty, etc.). If permission is denied, captures still succeed mechanically but produce solid-black frames.
 
+### macOS Spaces and "windowed apps"
+
+A maximized macOS application lives on its own Space — you swipe between Spaces using the trackpad or `Ctrl-←` / `Ctrl-→`. `screengrab --list-sources` lists every such app window, and the GUI shows them under a *Windowed apps* group. Each entry is tagged `[live]` when its content is currently on the active Space, or `[off-Space]` when it is on a different Space.
+
+You can pick an `[off-Space]` window as your recording target. However, no public macOS API (including Apple's own `screencapture -l`) can grab pixels from a Space that is not currently being rendered — the compositor simply has no frame to give. In practice this means:
+
+- Region picker preview is only available for `[live]` sources.
+- Recording an off-Space window starts a capture loop that emits a `frame_skipped` event for every interval where the target is still off-Space. The moment you swipe to that Space, capture resumes seamlessly and frames begin landing on disk.
+
+The recommended flow for a fullscreen app is therefore: pick the app in the source dropdown, click *Use full source*, *Start recording*, then swipe to the target Space and interact with the app. When you stop, the *Review* grid shows only the frames that landed while the Space was visible.
+
 ## Cross-platform
 
-The capture backend is [`kbinani/screenshot`](https://github.com/kbinani/screenshot), which has builds for macOS, Linux (X11), and Windows. macOS is the verified target; the other platforms compile from the same source but are untested here.
+The capture backend is [`kbinani/screenshot`](https://github.com/kbinani/screenshot), which has builds for macOS, Linux (X11), and Windows. The desktop GUI uses Wails v3, whose webview is WebKit on macOS, WebView2 on Windows, and WebKitGTK on Linux. macOS arm64 is the verified target; the other platforms compile from the same source but are untested here.
+
+Wails v3 is currently in **alpha** (this build uses `v3.0.0-alpha.91`). The native Liquid Glass APIs (`MacBackdropLiquidGlass`, `LiquidGlassStyle*`, `NSVisualEffectMaterial*`) are macOS-only; non-Mac platforms render a transparent webview that falls back to the CSS recipe.
 
 ## Performance notes
 
@@ -105,12 +142,22 @@ The capture backend is [`kbinani/screenshot`](https://github.com/kbinani/screens
 
 ```
 screengrab/
-  main.go         # CLI, capture loop, frame and spritesheet writers
-  contract.md     # binary acceptance criteria for the project
+  main.go             # CLI, capture loop, frame and spritesheet writers, captureFrame / captureRegion helpers
+  source.go           # unified Source abstraction (display:N | window:0xID), parseSource, listSources, captureSource
+  mac_capture.go      # darwin-only CGo bindings to ScreenCaptureKit for window enumeration and capture
+  mac_capture_stub.go # !darwin stub: returns ErrWindowCaptureUnsupported
+  gui.go              # Wails v3 desktop entry: MacLiquidGlass window + captureService bindings
+  gui_test.go         # tests for the copyFrames helper used by the GUI's save flow
+  source_test.go      # parseSource + Source ID round-trip tests
+  frontend/
+    index.html        # four-view shell (setup, region picker, recording, review)
+    style.css         # Liquid Glass content surfaces + reduced-transparency / contrast / motion fallbacks
+    main.js           # state machine, Wails runtime calls via Call.ByName, drag-to-select region picker
+  contract.md         # binary acceptance criteria for the project (CLI + GUI)
   go.mod / go.sum
-  README.md       # this file
-  CLAUDE.md       # guidance for AI agents working on this repo
-  AGENTS.md       # symlink → CLAUDE.md
+  README.md           # this file
+  CLAUDE.md           # guidance for AI agents working on this repo
+  AGENTS.md           # symlink → CLAUDE.md
 ```
 
 ## License

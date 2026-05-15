@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>screengrab</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <!-- SVG filter for the CSS Liquid Glass edge refraction (Windows / Linux fallback) -->
+  <svg width="0" height="0" aria-hidden="true" class="sg-filters">
+    <filter id="sg-liquid-edge">
+      <feTurbulence type="turbulence" baseFrequency="0.012 0.008" numOctaves="2" seed="3" result="turb" />
+      <feDisplacementMap in="SourceGraphic" in2="turb" scale="14" xChannelSelector="R" yChannelSelector="G" />
+    </filter>
+  </svg>
+
+  <header class="titlebar" data-wml-drag>
+    <div class="titlebar-meta">
+      <span class="titlebar-app">screengrab</span>
+      <span class="titlebar-sub" id="subtitle">capture for vision-capable LLMs</span>
+    </div>
+    <div class="titlebar-actions">
+      <button class="chip" id="quitBtn" aria-label="Quit">✕</button>
+    </div>
+  </header>
+
+  <main id="root">
+    <!-- ─── Setup view ──────────────────────────────────── -->
+    <section class="view view-setup glass-card" data-view="setup">
+      <h1 class="view-title">Set up your capture</h1>
+      <p class="view-help">screengrab records the screen at a fixed FPS and writes individual PNGs or a spritesheet. The defaults are tuned for handing the result to a vision-capable LLM, so the frame rate is intentionally low.</p>
+
+      <div class="field">
+        <label class="field-label" for="sourceSel">Capture source</label>
+        <div class="select-wrap">
+          <select id="sourceSel" class="control"></select>
+        </div>
+        <p class="field-hint">Pick a physical display, or a windowed application (including a maximized app on its own Space — those normally need a swipe to reach).</p>
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label class="field-label" for="fpsInput">Frames per second</label>
+          <input id="fpsInput" type="number" min="1" step="1" value="2" class="control" />
+        </div>
+        <div class="field">
+          <label class="field-label" for="outputInput">Output base directory</label>
+          <input id="outputInput" type="text" value="screengrab-out" class="control" />
+        </div>
+      </div>
+
+      <div class="field">
+        <label class="field-label">Capture region</label>
+        <div class="region-summary glass-pill" id="regionSummary">Full source</div>
+        <p class="field-hint window-hint" id="windowHint" hidden></p>
+      </div>
+
+      <footer class="view-actions">
+        <button class="btn btn-secondary" id="pickRegionBtn">Pick region</button>
+        <button class="btn btn-secondary" id="fullDisplayBtn">Use full source</button>
+        <button class="btn btn-primary" id="startBtn">Start recording</button>
+      </footer>
+    </section>
+
+    <!-- ─── Region picker view ──────────────────────────── -->
+    <section class="view view-region glass-card" data-view="region" hidden>
+      <h1 class="view-title">Drag a region on the preview</h1>
+      <p class="view-help"><span id="regionLive">Region: (drag to select)</span></p>
+
+      <div class="region-stage glass-pill" id="regionStage">
+        <img id="regionPreview" alt="display preview" />
+        <div class="region-rect" id="regionRect" hidden></div>
+        <div class="region-drag" id="regionDrag"></div>
+      </div>
+
+      <footer class="view-actions">
+        <button class="btn btn-secondary" id="regionResetBtn">Reset</button>
+        <button class="btn btn-secondary" id="regionCancelBtn">Cancel</button>
+        <button class="btn btn-primary" id="regionConfirmBtn">Confirm region</button>
+      </footer>
+    </section>
+
+    <!-- ─── Countdown view (window sources only) ────────── -->
+    <section class="view view-countdown glass-card" data-view="countdown" hidden>
+      <h1 class="view-title">Switch to the target window</h1>
+      <p class="view-help" id="countdownHelp">
+        Recording captures pixels only while the target window's macOS Space is visible. Use the trackpad swipe or
+        <kbd>Ctrl</kbd> <kbd>→</kbd> now — capture starts when the timer hits zero.
+      </p>
+
+      <div class="countdown-big" id="countdownBig" aria-live="assertive">3</div>
+      <p class="countdown-target" id="countdownTarget">Target: —</p>
+
+      <footer class="view-actions">
+        <button class="btn btn-secondary" id="countdownCancelBtn">Cancel</button>
+      </footer>
+    </section>
+
+    <!-- ─── Recording view ──────────────────────────────── -->
+    <section class="view view-recording glass-card" data-view="recording" hidden>
+      <h1 class="view-title">Recording</h1>
+      <p class="view-help" id="recordingSub">Press Stop when you are done; partial output is preserved.</p>
+
+      <div class="rec-stats">
+        <div class="rec-stat">
+          <div class="rec-label">Elapsed</div>
+          <div class="rec-value" id="recElapsed">0.0s</div>
+        </div>
+        <div class="rec-stat">
+          <div class="rec-label">Frames</div>
+          <div class="rec-value" id="recFrames">0</div>
+        </div>
+      </div>
+
+      <div class="rec-pulse" aria-hidden="true">
+        <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+      </div>
+
+      <footer class="view-actions">
+        <button class="btn btn-primary" id="stopBtn">Stop recording</button>
+      </footer>
+    </section>
+
+    <!-- ─── Review view ─────────────────────────────────── -->
+    <section class="view view-review glass-card" data-view="review" hidden>
+      <h1 class="view-title">Review &amp; pick frames</h1>
+      <p class="view-help"><span id="reviewSummary">0 frames captured.</span> Click a tile to toggle its selection.</p>
+
+      <div class="review-toolbar">
+        <button class="btn btn-tertiary" id="selectAllBtn">Select all</button>
+        <button class="btn btn-tertiary" id="clearAllBtn">Clear</button>
+      </div>
+
+      <div class="review-grid" id="reviewGrid"></div>
+
+      <footer class="view-actions">
+        <button class="btn btn-secondary" id="discardBtn">Discard &amp; back</button>
+        <button class="btn btn-primary" id="saveBtn">Save selected &amp; copy path</button>
+      </footer>
+    </section>
+
+    <!-- ─── Toast ───────────────────────────────────────── -->
+    <div class="toast glass-pill" id="toast" hidden></div>
+  </main>
+
+  <script type="module" src="/main.js"></script>
+</body>
+</html>

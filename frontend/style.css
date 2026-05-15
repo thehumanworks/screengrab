@@ -1,0 +1,614 @@
+/*
+ * screengrab — Liquid Glass content surfaces.
+ *
+ * The window itself is the OS-rendered NSGlassEffectView on macOS 26+. On
+ * older macOS it falls back to NSVisualEffectView. On Windows / Linux the
+ * window is opaque so the layered CSS recipe below carries the look.
+ *
+ * Glass cards are kept to one floating surface per view, per Apple's rule
+ * that glass cannot sample other glass and that the navigation layer is the
+ * only legitimate home for the material.
+ */
+
+/*
+ * The window backdrop is OS-rendered Liquid Glass on macOS 26+, which adapts
+ * automatically to system appearance. Our content text needs to flip with it
+ * — light theme uses near-black text on the bright material, dark theme uses
+ * near-white. Defaulting to dark text matches macOS Light Mode (the more
+ * common default) and reads against the system-blurred background.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  --sg-radius: 1.25rem;
+  --sg-radius-pill: 9999px;
+
+  /* light-mode palette (default): dark text on the bright OS glass */
+  --sg-fg: rgba(20, 22, 28, 0.94);
+  --sg-fg-dim: rgba(30, 32, 40, 0.68);
+  --sg-fg-muted: rgba(40, 44, 56, 0.50);
+  --sg-card-bg: rgba(255, 255, 255, 0.32);
+  --sg-card-inset: rgba(255, 255, 255, 0.55);
+  --sg-pill-bg: rgba(255, 255, 255, 0.45);
+  --sg-control-bg: rgba(255, 255, 255, 0.55);
+  --sg-control-bg-hover: rgba(255, 255, 255, 0.72);
+  --sg-stroke: rgba(0, 0, 0, 0.10);
+  --sg-stroke-strong: rgba(0, 0, 0, 0.20);
+  --sg-shadow: 0 12px 36px rgba(20, 25, 40, 0.18);
+
+  --sg-accent: #1a78ff;
+  --sg-accent-strong: #0a5cd8;
+  --sg-accent-fg: #ffffff;
+  --sg-danger: #ff3b4f;
+
+  --sg-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --sg-fg: rgba(245, 246, 250, 0.96);
+    --sg-fg-dim: rgba(225, 228, 236, 0.68);
+    --sg-fg-muted: rgba(210, 215, 225, 0.48);
+    --sg-card-bg: rgba(255, 255, 255, 0.06);
+    --sg-card-inset: rgba(255, 255, 255, 0.18);
+    --sg-pill-bg: rgba(255, 255, 255, 0.08);
+    --sg-control-bg: rgba(255, 255, 255, 0.08);
+    --sg-control-bg-hover: rgba(255, 255, 255, 0.14);
+    --sg-stroke: rgba(255, 255, 255, 0.16);
+    --sg-stroke-strong: rgba(255, 255, 255, 0.32);
+    --sg-shadow: 0 12px 40px rgba(0, 0, 0, 0.32);
+    --sg-accent: #5fb3ff;
+    --sg-accent-strong: #2d8df8;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: transparent;
+  color: var(--sg-fg);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Helvetica Neue", sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  letter-spacing: -0.005em;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.sg-filters {
+  position: absolute;
+  pointer-events: none;
+  width: 0;
+  height: 0;
+}
+
+/* ─── Title bar (frameless window drag region) ─────────────────────────── */
+
+.titlebar {
+  -webkit-app-region: drag;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 22px 6px 84px;        /* leave room for the macOS traffic lights */
+  flex: 0 0 auto;
+}
+
+.titlebar-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.titlebar-app {
+  font-weight: 600;
+  font-size: 13px;
+  letter-spacing: 0.005em;
+  color: var(--sg-fg);
+}
+
+.titlebar-sub {
+  font-size: 12px;
+  color: var(--sg-fg-muted);
+}
+
+.titlebar-actions {
+  -webkit-app-region: no-drag;
+  display: flex;
+  gap: 8px;
+}
+
+.chip {
+  -webkit-app-region: no-drag;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--sg-control-bg);
+  color: var(--sg-fg-dim);
+  border: 1px solid var(--sg-stroke);
+  cursor: pointer;
+  font-size: 12px;
+  transition: background-color 0.18s var(--sg-spring), color 0.18s var(--sg-spring), transform 0.18s var(--sg-spring);
+}
+.chip:hover { background: rgba(255, 80, 90, 0.55); color: white; transform: scale(1.04); }
+
+/* ─── Main view area ──────────────────────────────────────────────────── */
+
+main {
+  flex: 1 1 auto;
+  padding: 8px 28px 24px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 16px;
+}
+
+.view {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 22px 24px 18px;
+  flex: 1 1 auto;
+  min-height: 0;
+  animation: sg-view-in 0.42s var(--sg-spring) both;
+}
+
+.view[hidden] { display: none; }
+
+.view-title {
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.012em;
+  margin: 0;
+}
+
+.view-help {
+  color: var(--sg-fg-dim);
+  margin: 0;
+  max-width: 60ch;
+}
+
+.view-actions {
+  margin-top: auto;
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+  padding-top: 12px;
+}
+
+@keyframes sg-view-in {
+  from { opacity: 0; transform: translateY(6px) scale(0.992); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* ─── Liquid Glass surfaces (layered recipe) ──────────────────────────── */
+
+.glass-card {
+  position: relative;
+  border-radius: var(--sg-radius);
+  background: var(--sg-card-bg);
+  isolation: isolate;
+  overflow: hidden;
+  border: 1px solid var(--sg-stroke);
+  box-shadow:
+    var(--sg-shadow),
+    inset 0 1px 0 var(--sg-card-inset);
+}
+
+/* Layer 2 + 3: backdrop blur, saturation lift, and a subtle SVG-driven
+   refraction map. Chromium reads the url() filter; WebKit silently drops it
+   and keeps the blur + saturate parts, which is the documented fallback. */
+.glass-card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  backdrop-filter: url(#sg-liquid-edge) blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  pointer-events: none;
+  z-index: -2;
+}
+
+/* Layer 4: faint film grain to break up the otherwise flat blur. */
+.glass-card::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background:
+    radial-gradient(circle at 30% 20%, rgba(255, 255, 255, 0.10), transparent 55%),
+    radial-gradient(circle at 80% 90%, rgba(120, 180, 255, 0.10), transparent 55%);
+  mix-blend-mode: screen;
+  pointer-events: none;
+  z-index: -1;
+}
+
+.glass-pill {
+  position: relative;
+  border-radius: var(--sg-radius-pill);
+  background: var(--sg-pill-bg);
+  border: 1px solid var(--sg-stroke);
+  padding: 8px 14px;
+  font-size: 13px;
+  color: var(--sg-fg);
+  isolation: isolate;
+}
+
+/* ─── Form controls ───────────────────────────────────────────────────── */
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+
+.field-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--sg-fg-muted);
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.field-hint {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--sg-fg-muted);
+  line-height: 1.45;
+}
+
+.field-hint.window-hint {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--sg-control-bg);
+  border: 1px solid var(--sg-stroke);
+  color: var(--sg-fg);
+  font-size: 12.5px;
+}
+
+.field-hint.window-hint strong { color: var(--sg-accent, var(--sg-fg)); }
+.field-hint.window-hint em { font-style: normal; font-weight: 600; }
+
+.control,
+.select-wrap select {
+  -webkit-appearance: none;
+  appearance: none;
+  background: var(--sg-control-bg);
+  border: 1px solid var(--sg-stroke);
+  border-radius: 10px;
+  padding: 10px 12px;
+  color: var(--sg-fg);
+  font: inherit;
+  outline: none;
+  transition: border-color 0.2s var(--sg-spring), background-color 0.2s var(--sg-spring);
+}
+
+.control:focus,
+.select-wrap select:focus {
+  border-color: var(--sg-accent);
+  background: var(--sg-control-bg-hover);
+}
+
+.select-wrap {
+  position: relative;
+}
+
+.select-wrap::after {
+  content: "▾";
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--sg-fg-dim);
+  pointer-events: none;
+  font-size: 11px;
+}
+
+.region-summary {
+  align-self: flex-start;
+}
+
+/* ─── Buttons ─────────────────────────────────────────────────────────── */
+
+.btn {
+  -webkit-app-region: no-drag;
+  position: relative;
+  font: inherit;
+  font-weight: 500;
+  letter-spacing: 0.005em;
+  padding: 10px 18px;
+  border-radius: 11px;
+  border: 1px solid var(--sg-stroke);
+  cursor: pointer;
+  color: var(--sg-fg);
+  background: var(--sg-control-bg);
+  transition: background-color 0.18s var(--sg-spring),
+              transform 0.18s var(--sg-spring),
+              border-color 0.18s var(--sg-spring),
+              box-shadow 0.18s var(--sg-spring);
+}
+.btn:hover { background: var(--sg-control-bg-hover); }
+.btn:active { transform: scale(0.97); }
+
+.btn-primary {
+  background: linear-gradient(135deg, var(--sg-accent), var(--sg-accent-strong));
+  border-color: var(--sg-accent-strong);
+  color: var(--sg-accent-fg);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35),
+              0 6px 18px rgba(20, 80, 200, 0.28);
+}
+.btn-primary:hover {
+  background: linear-gradient(135deg, #2f8aff, #0e69e8);
+}
+
+.btn-secondary { background: var(--sg-control-bg); }
+
+.btn-tertiary {
+  background: transparent;
+  border-color: transparent;
+  color: var(--sg-fg-dim);
+}
+.btn-tertiary:hover {
+  background: var(--sg-control-bg);
+  color: var(--sg-fg);
+}
+
+/* ─── Region picker ───────────────────────────────────────────────────── */
+
+.region-stage {
+  position: relative;
+  padding: 0;
+  overflow: hidden;
+  border-radius: var(--sg-radius);
+  background: rgba(0, 0, 0, 0.4);
+  align-self: center;
+  max-width: 100%;
+  max-height: 100%;
+  cursor: crosshair;
+}
+
+#regionPreview {
+  display: block;
+  width: 100%;
+  height: auto;
+  pointer-events: none;
+  user-select: none;
+}
+
+.region-drag {
+  position: absolute;
+  inset: 0;
+}
+
+.region-rect {
+  position: absolute;
+  border: 2px solid var(--sg-accent);
+  background: rgba(95, 179, 255, 0.18);
+  border-radius: 4px;
+  pointer-events: none;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.25), inset 0 0 0 1px rgba(255, 255, 255, 0.35);
+}
+
+/* ─── Recording view ──────────────────────────────────────────────────── */
+
+.rec-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+
+.rec-stat {
+  padding: 18px 22px;
+  border-radius: var(--sg-radius);
+  background: var(--sg-card-bg);
+  border: 1px solid var(--sg-stroke);
+}
+
+.rec-label {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--sg-fg-muted);
+}
+
+.rec-value {
+  font-size: 36px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  margin-top: 4px;
+  color: var(--sg-fg);
+}
+
+.rec-pulse {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+  padding: 12px 0 0;
+}
+
+.rec-pulse .dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--sg-danger);
+  animation: sg-pulse 1.4s ease-in-out infinite;
+}
+.rec-pulse .dot:nth-child(2) { animation-delay: 0.18s; }
+.rec-pulse .dot:nth-child(3) { animation-delay: 0.36s; }
+
+@keyframes sg-pulse {
+  0%, 100% { opacity: 0.35; transform: scale(1); }
+  50%      { opacity: 1;    transform: scale(1.25); }
+}
+
+/* ─── Countdown view (window sources) ─────────────────────────────────── */
+
+.countdown-big {
+  font-size: 92px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  text-align: center;
+  margin: 18px 0 4px;
+  color: var(--sg-fg);
+  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.4), 0 0 28px rgba(255, 255, 255, 0.18);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.05;
+  animation: sg-countdown-pop 0.45s ease-out;
+}
+
+.countdown-target {
+  margin: 0 auto 8px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--sg-fg-muted);
+  max-width: 80%;
+}
+
+@keyframes sg-countdown-pop {
+  0%   { transform: scale(0.6); opacity: 0; }
+  60%  { transform: scale(1.12); opacity: 1; }
+  100% { transform: scale(1);    opacity: 1; }
+}
+
+kbd {
+  display: inline-block;
+  padding: 1px 6px;
+  margin: 0 1px;
+  border-radius: 6px;
+  border: 1px solid var(--sg-stroke);
+  background: var(--sg-control-bg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--sg-fg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .countdown-big { animation: none; }
+}
+
+/* ─── Review grid ─────────────────────────────────────────────────────── */
+
+.review-toolbar {
+  display: flex;
+  gap: 6px;
+}
+
+.review-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+  gap: 12px;
+  overflow-y: auto;
+  padding: 4px 4px 12px;
+}
+
+.frame-tile {
+  position: relative;
+  border-radius: 14px;
+  overflow: hidden;
+  border: 2px solid transparent;
+  cursor: pointer;
+  background: rgba(0, 0, 0, 0.45);
+  transition: transform 0.18s var(--sg-spring), border-color 0.18s var(--sg-spring), box-shadow 0.18s var(--sg-spring);
+}
+
+.frame-tile img {
+  display: block;
+  width: 100%;
+  height: 110px;
+  object-fit: cover;
+  pointer-events: none;
+}
+
+.frame-tile .frame-index {
+  position: absolute;
+  top: 6px;
+  left: 8px;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: rgba(255, 255, 255, 0.85);
+  background: rgba(0, 0, 0, 0.45);
+  border-radius: 4px;
+  padding: 2px 6px;
+}
+
+.frame-tile.selected {
+  border-color: var(--sg-accent);
+  box-shadow: 0 0 0 4px rgba(95, 179, 255, 0.22);
+  transform: translateY(-1px);
+}
+
+.frame-tile:hover { transform: translateY(-1px); }
+
+/* ─── Toast ──────────────────────────────────────────────────────────── */
+
+.toast {
+  position: fixed;
+  bottom: 18px;
+  left: 50%;
+  transform: translateX(-50%) translateY(8px);
+  background: rgba(20, 22, 28, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  color: rgba(245, 246, 250, 0.96);
+  padding: 10px 18px;
+  max-width: 70%;
+  opacity: 0;
+  transition: opacity 0.25s var(--sg-spring), transform 0.25s var(--sg-spring);
+  z-index: 50;
+}
+
+.toast.show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+/* ─── Accessibility fallbacks (non-negotiable per Apple HIG) ──────────── */
+
+@media (prefers-reduced-transparency: reduce) {
+  :root {
+    --sg-card-bg: rgba(245, 247, 250, 0.98);
+    --sg-pill-bg: rgba(240, 242, 246, 0.98);
+    --sg-control-bg: rgba(240, 242, 246, 0.98);
+  }
+  .glass-card::before { backdrop-filter: none; -webkit-backdrop-filter: none; }
+}
+@media (prefers-reduced-transparency: reduce) and (prefers-color-scheme: dark) {
+  :root {
+    --sg-card-bg: rgba(30, 32, 38, 0.98);
+    --sg-pill-bg: rgba(40, 44, 52, 0.98);
+    --sg-control-bg: rgba(40, 44, 52, 0.98);
+  }
+}
+
+@media (prefers-contrast: more) {
+  .glass-card,
+  .glass-pill { border-color: currentColor; }
+  .frame-tile { border-color: rgba(255, 255, 255, 0.5); }
+  .btn-tertiary { color: var(--sg-fg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .view,
+  .btn,
+  .frame-tile,
+  .rec-pulse .dot,
+  .toast { animation: none !important; transition: none !important; }
+}

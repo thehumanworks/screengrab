@@ -21,21 +21,63 @@ import (
 const defaultFPS = 2.0
 
 type config struct {
-	fps      float64
-	duration time.Duration
-	output   string
-	mode     string
-	display  int
-	cols     int
+	fps         float64
+	duration    time.Duration
+	output      string
+	mode        string
+	display     int
+	source      string
+	cols        int
+	gui         bool
+	devtools    bool
+	listSources bool
 }
 
 func main() {
 	cfg := parseFlags()
 
-	if err := run(cfg); err != nil {
+	var err error
+	switch {
+	case cfg.listSources:
+		err = runListSources()
+	case cfg.gui:
+		err = runGUI(cfg)
+	default:
+		err = run(cfg)
+	}
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "screengrab: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func runListSources() error {
+	srcs := listSources()
+	if len(srcs) == 0 {
+		fmt.Println("(no capturable sources detected — on macOS this usually means Screen Recording permission has not been granted)")
+		return nil
+	}
+	fmt.Println("Visibility legend: [live] = on the current Space, capture works now.")
+	fmt.Println("                   [off-Space] = on another macOS Space; swipe to it before recording.")
+	fmt.Println()
+	for _, s := range srcs {
+		state := "live"
+		if !s.OnScreen {
+			state = "off-Space"
+		}
+		fmt.Printf("%-22s  [%-9s]  %s  %d×%d\n", s.ID, state, s.Name, s.Width, s.Height)
+	}
+	return nil
+}
+
+// resolveCLISource picks the capture source for the headless CLI run.
+// --source wins when set; otherwise we fall back to the legacy --display N
+// form so existing scripts keep working without a flag rename.
+func resolveCLISource(cfg config) (Source, error) {
+	if cfg.source != "" {
+		return parseSource(cfg.source)
+	}
+	return resolveDisplaySource(cfg.display)
 }
 
 func parseFlags() config {
@@ -44,8 +86,12 @@ func parseFlags() config {
 	flag.DurationVar(&cfg.duration, "duration", 0, "max recording duration (e.g. 10s, 1m). 0 = record until SIGINT (Ctrl+C)")
 	flag.StringVar(&cfg.output, "output", "screengrab-out", "output directory")
 	flag.StringVar(&cfg.mode, "mode", "frames", "output mode: 'frames' for individual PNGs, 'spritesheet' for one composite PNG with sidecar JSON")
-	flag.IntVar(&cfg.display, "display", 0, "display index to capture (0 = primary)")
+	flag.IntVar(&cfg.display, "display", 0, "display index to capture (0 = primary); shorthand for --source display:N")
+	flag.StringVar(&cfg.source, "source", "", "capture source: 'display:N' for a physical display, or 'window:0xID' for a macOS maximized-app window (see --list-sources). Overrides --display when set.")
 	flag.IntVar(&cfg.cols, "cols", 0, "columns in spritesheet (0 = auto ~= sqrt of frame count)")
+	flag.BoolVar(&cfg.gui, "gui", false, "launch the cross-platform desktop GUI (region picker, multi-select frame review, clipboard handoff)")
+	flag.BoolVar(&cfg.devtools, "devtools", false, "open the webview devtools panel when --gui is set")
+	flag.BoolVar(&cfg.listSources, "list-sources", false, "print every capturable source (displays and macOS windows) and exit")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage: screengrab [flags]\n\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "Records the screen at a fixed FPS and outputs frames or a spritesheet.\n")
@@ -63,14 +109,14 @@ func run(cfg config) error {
 	if cfg.mode != "frames" && cfg.mode != "spritesheet" {
 		return fmt.Errorf("--mode must be 'frames' or 'spritesheet' (got %q)", cfg.mode)
 	}
-	if cfg.display < 0 || cfg.display >= screenshot.NumActiveDisplays() {
-		return fmt.Errorf("--display %d out of range (active displays: %d)", cfg.display, screenshot.NumActiveDisplays())
+	src, err := resolveCLISource(cfg)
+	if err != nil {
+		return err
 	}
 	if err := os.MkdirAll(cfg.output, 0o755); err != nil {
 		return fmt.Errorf("create output dir: %w", err)
 	}
 
-	bounds := screenshot.GetDisplayBounds(cfg.display)
 	interval := time.Duration(float64(time.Second) / cfg.fps)
 
 	stopCh := make(chan os.Signal, 1)
@@ -87,8 +133,8 @@ func run(cfg config) error {
 		}
 	}
 
-	fmt.Fprintf(os.Stderr, "screengrab: display=%d size=%dx%d fps=%v interval=%v mode=%s output=%s\n",
-		cfg.display, bounds.Dx(), bounds.Dy(), cfg.fps, interval, cfg.mode, cfg.output)
+	fmt.Fprintf(os.Stderr, "screengrab: source=%s name=%q size=%dx%d fps=%v interval=%v mode=%s output=%s\n",
+		src.ID, src.Name, src.Width, src.Height, cfg.fps, interval, cfg.mode, cfg.output)
 	if targetFrames > 0 {
 		fmt.Fprintf(os.Stderr, "screengrab: will capture %d frames over %v or stop on Ctrl+C\n", targetFrames, cfg.duration)
 	} else {
@@ -103,7 +149,7 @@ func run(cfg config) error {
 	start := time.Now()
 
 	// Capture one frame immediately at t=0 so a short duration still yields frames.
-	if img, err := captureFrame(cfg.display); err != nil {
+	if img, err := captureSource(src); err != nil {
 		return err
 	} else {
 		frameCount++
@@ -122,7 +168,7 @@ loop:
 			fmt.Fprintln(os.Stderr, "screengrab: SIGINT received, stopping")
 			break loop
 		case <-ticker.C:
-			img, err := captureFrame(cfg.display)
+			img, err := captureSource(src)
 			if err != nil {
 				return err
 			}
@@ -151,6 +197,24 @@ func captureFrame(display int) (*image.RGBA, error) {
 	img, err := screenshot.CaptureDisplay(display)
 	if err != nil {
 		return nil, fmt.Errorf("capture display %d: %w", display, err)
+	}
+	return img, nil
+}
+
+// captureRegion grabs the rectangle (x, y, w, h) on the given display, where
+// (x, y) are expressed in display-local coordinates (0,0 = top-left of that
+// display). w or h <= 0 captures the full display.
+func captureRegion(display, x, y, w, h int) (*image.RGBA, error) {
+	if w <= 0 || h <= 0 {
+		return captureFrame(display)
+	}
+	bounds := screenshot.GetDisplayBounds(display)
+	rx := bounds.Min.X + x
+	ry := bounds.Min.Y + y
+	img, err := screenshot.Capture(rx, ry, w, h)
+	if err != nil {
+		return nil, fmt.Errorf("capture region display=%d rect=(%d,%d %dx%d): %w",
+			display, rx, ry, w, h, err)
 	}
 	return img, nil
 }
