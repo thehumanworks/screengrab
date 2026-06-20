@@ -1,4 +1,5 @@
 # Binaries for programs and plugins
+screengrab
 *.exe
 *.exe~
 *.dll
@@ -21,6 +22,12 @@ vendor/
 # Build directories
 bin/
 dist/
+
+# screengrab capture/test output
+/out_*/
+/screengrab-out/
+/capture-*/
+/selected-*/
 
 # Go build cache
 .cache/

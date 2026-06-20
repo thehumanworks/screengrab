@@ -102,7 +102,14 @@ verify: build ## Run every contract criterion end-to-end.
 	  ./$(BINARY) --help 2>&1 | grep -qE '\-duration' && \
 	  ./$(BINARY) --help 2>&1 | grep -qE '\-output' && \
 	  ./$(BINARY) --help 2>&1 | grep -qE '\-mode' && \
-	  ./$(BINARY) --help 2>&1 | grep -qE '\-display'
+	  ./$(BINARY) --help 2>&1 | grep -qE '\-display' && \
+	  ./$(BINARY) --help 2>&1 | grep -qE '\-json' && \
+	  ./$(BINARY) --help 2>&1 | grep -qE '\-frames' && \
+	  ./$(BINARY) --help 2>&1 | grep -qE '\-region' && \
+	  ./$(BINARY) --help 2>&1 | grep -qE '\-max-dim' && \
+	  ./$(BINARY) --help 2>&1 | grep -qE '\-format' && \
+	  ./$(BINARY) --help 2>&1 | grep -qE '\-quality' && \
+	  ./$(BINARY) --help 2>&1 | grep -qE '\-overwrite'
 	@echo "→ C3: defaultFPS ≤ 4"
 	@grep -qE '^const defaultFPS = ([0-4](\.[0-9]+)?)$$' main.go
 	@echo "→ C4: frames mode produces fps*duration PNGs"
@@ -125,13 +132,15 @@ verify: build ## Run every contract criterion end-to-end.
 	@grep -qE 'application\.NewService\(' gui.go
 	@echo "→ C11/C16: TestCopyFrames + binding regression test"
 	@$(GO) test -count=1 -ldflags '$(LDFLAGS)' ./... >/dev/null
+	@echo "→ C26-C30: agent-ready CLI controls"
+	@$(GO) test -count=1 -ldflags '$(LDFLAGS)' ./... -run 'Test(ParseRegionSpec|PlannedFrameCountCapsDuration|FitToMaxDim|NormalizeConfigFormatAndValidation|WriteImageJPEG|PrepareOutputDirOverwriteGuard)' >/dev/null
 	@echo "→ C12: frontend is embedded"
 	@grep -qE '^//go:embed.*frontend' gui.go
 	@echo "→ C13: CSS Liquid Glass + a11y fallbacks"
 	@grep -qE 'backdrop-filter' frontend/style.css
 	@grep -qE 'prefers-reduced-transparency' frontend/style.css
 	@grep -qE 'prefers-reduced-motion' frontend/style.css
-	@rm -rf out_frames out_sheet
+	@rm -rf out_frames out_sheet out_agent
 	@echo "✓ all contract criteria pass"
 
 # ─── Install / uninstall ────────────────────────────────────────────────
@@ -180,4 +189,4 @@ app: build-release ## Package a minimal screengrab.app bundle on macOS.
 .PHONY: clean
 clean: ## Remove build artifacts and demo capture directories.
 	rm -f $(BINARY)
-	rm -rf out_frames out_sheet out_sigint out_demo dist screengrab-out
+	rm -rf out_* out_demo dist screengrab-out capture-* selected-*

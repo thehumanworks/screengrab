@@ -35,9 +35,16 @@ The resulting `./screengrab` is a self-contained binary. On macOS arm64 it is ar
 # Faster sampling, secondary display
 ./screengrab --duration 4s --fps 4 --display 1 --output clip
 
+# Agent-friendly bounded capture: 3 JPEG frames, cropped and downscaled,
+# with compact JSON on stdout and full metadata in manifest.json
+./screengrab --frames 3 --region 0,0,1280,720 --max-dim 768 --format jpg --quality 80 --json --output clip
+
 # Discover capturable sources (displays + macOS windows, incl. maximized apps
 # on inactive Spaces that normally need a swipe to reach)
 ./screengrab --list-sources
+
+# Discover sources as JSON for scripts/agents
+./screengrab --list-sources --json
 
 # Record a single macOS window by its ID from --list-sources
 ./screengrab --duration 4s --source window:0x21cb --output window-clip
@@ -49,12 +56,19 @@ The resulting `./screengrab` is a self-contained binary. On macOS arm64 it is ar
 |------|---------|-------------|
 | `--fps` | `2` | Frames per second. Kept deliberately low because output is intended for AI models. |
 | `--duration` | `0` (run until Ctrl+C) | Max recording duration, e.g. `10s`, `1m`, `90s`. When set, exactly `round(fps * seconds)` frames are captured. |
+| `--frames` | `0` | Maximum frames to capture. `0` means derive from `--duration` or run until stopped. When both `--duration` and `--frames` are set, the smaller frame count wins. |
 | `--output` | `screengrab-out` | Output directory (created if missing). |
 | `--mode` | `frames` | `frames` writes one PNG per capture; `spritesheet` writes one composite PNG plus `spritesheet.json`. |
+| `--format` | `png` | Image format: `png`, `jpg`, or `jpeg`. JPEG output uses `.jpg` filenames. |
+| `--quality` | `85` | JPEG quality from `1` to `100`; ignored for PNG. |
 | `--display` | `0` | Display index. `0` is the primary display. Kept as a shorthand for `--source display:N`. |
 | `--source` | (unset) | Explicit capture source: `display:N` for a physical display, or `window:0xID` for a macOS window (run `--list-sources` to get the IDs). Overrides `--display` when present. |
 | `--list-sources` | `false` | Print every capturable source (displays and macOS windows) and exit. |
+| `--region` | (unset) | Optional source-local crop rectangle, formatted as `x,y,w,h`, applied before scaling and encoding. |
+| `--max-dim` | `0` | Downscale each frame so its longest edge is at most this many pixels. `0` keeps original size. |
 | `--cols` | `0` (auto) | Columns in spritesheet grid; defaults to `ceil(sqrt(frame_count))`. |
+| `--json` | `false` | Emit machine-readable JSON for `--list-sources` and final capture summaries. Capture summaries point to `manifest.json` for the full file list. |
+| `--overwrite` | `false` | Allow replacing generated files already present in the output directory. Without this, existing `frame_*`, `spritesheet.*`, or `manifest.json` files cause a fail-fast error. |
 | `--gui` | `false` | Launch the cross-platform desktop GUI instead of the headless CLI flow. |
 | `--devtools` | `false` | Open the webview developer tools panel when `--gui` is set. |
 
@@ -86,6 +100,8 @@ out/
 ```
 
 Each PNG is the full display resolution, 8-bit per channel, non-interlaced.
+If `--format jpg` is used, frame files are JPEGs named `frame_0000.jpg`,
+`frame_0001.jpg`, and so on.
 
 ### `spritesheet` mode
 
@@ -111,6 +127,14 @@ out/
 ```
 
 Use the metadata to slice the sheet back into frames programmatically. Frames are laid out left-to-right, top-to-bottom in capture order.
+
+### `manifest.json`
+
+Every capture run writes `manifest.json` in the output directory. It records the
+source, fps, requested and captured frame counts, crop region, `--max-dim`,
+format/quality, output dimensions, byte sizes, elapsed time, and generated
+file paths. With `--json`, stdout is a compact run summary that includes
+`manifest_path`; read the manifest only when you need the full file list.
 
 ## macOS permissions
 

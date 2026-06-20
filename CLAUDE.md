@@ -10,7 +10,7 @@ The behaviour is locked down by `contract.md`. Treat that file as the executable
 
 ## Files that matter
 
-- `main.go` — CLI entry, flag parsing, capture loop, frames writer, spritesheet compositor, and the `captureFrame` / `captureRegion` display-only primitives. Top-level capture now goes through `captureSource` in `source.go` rather than directly here; the file is still the place to wire new CLI flags. Stays in `package main`.
+- `main.go` — CLI entry, flag parsing, capture loop, frame/spritesheet writers, manifest writer, agent-ready JSON summary mode, and the `captureFrame` / `captureRegion` display-only primitives. Top-level capture now goes through `captureSource` in `source.go` rather than directly here; the file is still the place to wire new CLI flags. Stays in `package main`.
 - `source.go` — the load-bearing abstraction. Defines `Source{ID, Kind, Name, Width, Height, App, Title, OnScreen}` with `Kind ∈ {"display", "window"}`, plus `parseSource` (canonical `"display:N"` / `"window:0xID"` forms, with a legacy plain-int form accepted for back-compat with the old `--display N`), `listSources` (displays from kbinani, then darwin windows from `listMacWindows`), `captureSource`, and `captureSourceRegion`. Every CLI and GUI capture path funnels through here so window and display sources share the same handling. `listSources` filters and dedupes aggressively because raw `SCShareableContent.windows` is full of `*Service`, `*Helper`, `*Agent`, `*XPC` helpers and untitled popovers — see `isHelperApp` and `isLikelyUserWindow`. Windows whose pixel footprint matches a physical display within a small tolerance are tagged `Fullscreen Space — …` since that is the user's primary "swipe to" target. **Capturing an off-Space window is impossible**: `SCScreenshotManager` returns `"Failed to start stream due to audio/video capture failure"` and Apple's own `screencapture -l` returns `"could not create image from window"`, because the compositor literally does not render inactive-Space content. The `OnScreen` flag is propagated through to the GUI so it can show a "swipe over" hint instead of pretending to snapshot. Do not waste cycles trying to defeat this with private CGS APIs — Apple breaks them every release.
 - `mac_capture.go` (`//go:build darwin`) — CGo bridge to ScreenCaptureKit. Enumerates windows via `SCShareableContent` and captures them via `SCContentFilter.initWithDesktopIndependentWindow:` + `SCScreenshotManager.captureImageWithFilter:configuration:completionHandler:`, bridged to a synchronous Go call site with `dispatch_semaphore_t`. **Do not switch back to `CGWindowListCreateImage`**: it is marked `unavailable` (not just deprecated) on the macOS 15+ SDK and produces a hard build error. The `desktopIndependentWindow` filter is what makes recording a fullscreen-app window on an inactive Space work — without it the recording would only update while the Space was visible. `NSApplicationLoad()` is called once (via a `dispatch_once`) before the first SCK call; otherwise SCScreenshotManager aborts a CLI process with `CGS_REQUIRE_INIT`.
 - `mac_capture_stub.go` (`//go:build !darwin`) — empty `listMacWindows` and `ErrWindowCaptureUnsupported`-returning `captureMacWindow*` so the rest of the code compiles unchanged on Linux/Windows.
@@ -18,7 +18,7 @@ The behaviour is locked down by `contract.md`. Treat that file as the executable
 - `gui_test.go` — covers `copyFrames` round-trip (subset selection, byte equality, nested destination dir creation). The helper has no Wails or Fyne dependency so the test runs without a display.
 - `source_test.go` — covers `parseSource` (display kind, legacy plain int, window hex, window decimal, malformed inputs) and the round-trip `displaySourceID` → `parseSource` → `id` invariant.
 - `frontend/` — vanilla HTML/CSS/JS shell, embedded into the Go binary at build time. `index.html` declares four views (setup, region picker, recording, review); `style.css` carries the Liquid Glass content surfaces and the `prefers-reduced-transparency` / `prefers-contrast` / `prefers-reduced-motion` accessibility fallbacks; `main.js` is the state machine that calls into `captureService` via the `/wails/runtime.js` `Call.ByName` API. The runtime is served by Wails at runtime; we deliberately do not run the binding generator, so there is no `frontend/bindings/` directory.
-- `contract.md` — fifteen binary acceptance criteria (CLI 1-7, then GUI/Wails 8-15). Each row has a single grep or exit-zero signal.
+- `contract.md` — binary acceptance criteria for the CLI, GUI/Wails surface, and agent-ready capture controls. Each row has a single grep or exit-zero signal.
 - `go.mod` / `go.sum` — direct dependencies are `github.com/kbinani/screenshot` (display capture backend) and `github.com/wailsapp/wails/v3` (desktop shell — currently `v3.0.0-alpha.91`, alpha). Window-level capture on darwin is implemented in-tree via CGo against the system ScreenCaptureKit framework — no Go dependency for that path. Everything else in go.sum is transitive. Fyne has been fully removed; do not reintroduce it.
 - `.gitignore` — already excludes the compiled `screengrab` binary, output directories like `out_*/`, and the usual Go/macOS junk. Do not commit binaries or capture output.
 
@@ -33,9 +33,12 @@ go build -o screengrab .
 # Help (must exit 0 and list --fps, --duration, --output, --mode, --display)
 ./screengrab --help
 
-# Frames mode (must produce exactly 4 PNGs at the display resolution)
+# Frames mode (must produce exactly 4 PNGs at the display resolution plus manifest.json)
 ./screengrab --duration 2s --fps 2 --mode frames --output out_frames
 ls out_frames/*.png | wc -l   # → 4
+
+# Agent-oriented bounded capture (JSON summary plus manifest.json)
+./screengrab --frames 1 --max-dim 640 --format jpg --quality 80 --json --output out_agent
 
 # Spritesheet mode (must produce spritesheet.png + spritesheet.json)
 ./screengrab --duration 2s --fps 2 --mode spritesheet --output out_sheet
@@ -58,6 +61,7 @@ If any of these regress, the contract is broken and the change needs to be rever
 3. **Capture starts with an immediate frame at t=0.** This way short durations (e.g. `--duration 500ms --fps 2 = 1 frame`) still produce output instead of zero frames waiting for the first ticker fire.
 4. **SIGINT/SIGTERM are clean stops, not crashes.** The signal handler breaks the loop, the writer flushes anything already captured, and the process exits 0. Don't replace this with `log.Fatal` or `os.Exit(1)`.
 5. **Spritesheet mode holds frames in memory.** This is a known constraint, documented in the README. If you stream to disk and composite at the end, you need to delete the temp PNGs unless the user opts to keep them, otherwise users will be surprised by `frames` output appearing in spritesheet mode.
+6. **Headless agent output must stay parseable and bounded.** Keep `--json`, `manifest.json`, `--frames`, `--region`, `--max-dim`, `--format`, `--quality`, and `--overwrite` covered by `contract.md` and unit tests when changing CLI capture output.
 
 ## Platform reality
 
