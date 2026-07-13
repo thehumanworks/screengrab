@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"image"
 	"image/color"
 	"os"
@@ -9,6 +10,61 @@ import (
 	"testing"
 	"time"
 )
+
+func TestCLIOffSpaceWindowWaitsAndResumes(t *testing.T) {
+	ticks := make(chan time.Time, 2)
+	ticks <- time.Now()
+	ticks <- time.Now()
+	stop := make(chan os.Signal)
+	src := Source{ID: "window:0x1ebe", Kind: SourceKindWindow, OnScreen: false}
+
+	attempts := 0
+	existenceChecks := 0
+	stopped, err := runCaptureLoop(2, ticks, stop, func() (bool, error) {
+		_, captured, err := captureCLIFrame(src, func() (*image.RGBA, error) {
+			attempts++
+			if attempts == 1 {
+				return nil, errors.New("Failed to start stream due to audio/video capture failure")
+			}
+			return image.NewRGBA(image.Rect(0, 0, 2, 2)), nil
+		}, func(Source) bool {
+			existenceChecks++
+			return true
+		})
+		if err != nil {
+			return false, err
+		}
+		return captured, nil
+	})
+	if err != nil {
+		t.Fatalf("runCaptureLoop: %v", err)
+	}
+	if stopped {
+		t.Fatal("capture reported a signal stop")
+	}
+	if attempts != 3 {
+		t.Fatalf("capture attempts = %d, want 3 (off-Space miss plus two live frames)", attempts)
+	}
+	if existenceChecks != 1 {
+		t.Fatalf("window existence checks = %d, want 1 for the failed frame", existenceChecks)
+	}
+}
+
+func TestCLICaptureLoopFailsWhenWindowCloses(t *testing.T) {
+	want := errors.New("window capture failed")
+	src := Source{ID: "window:0x1ebe", Kind: SourceKindWindow}
+	_, err := runCaptureLoop(1, make(chan time.Time), make(chan os.Signal), func() (bool, error) {
+		_, captured, err := captureCLIFrame(src, func() (*image.RGBA, error) {
+			return nil, want
+		}, func(Source) bool {
+			return false
+		})
+		return captured, err
+	})
+	if !errors.Is(err, want) {
+		t.Fatalf("runCaptureLoop error = %v, want %v", err, want)
+	}
+}
 
 func TestParseRegionSpec(t *testing.T) {
 	got, err := parseRegionSpec("10, 20, 300, 200")
@@ -69,6 +125,16 @@ func TestNormalizeConfigFormatAndValidation(t *testing.T) {
 	if err := normalizeConfig(&bad); err == nil {
 		t.Fatalf("expected invalid quality to fail")
 	}
+
+	transcriptWithoutMic := config{fps: 2, mode: "frames", format: "png", quality: 85, output: ".", transcript: true}
+	if err := normalizeConfig(&transcriptWithoutMic); err == nil || !strings.Contains(err.Error(), "--microphone") {
+		t.Fatalf("expected transcript without microphone to fail, got %v", err)
+	}
+
+	localeWithoutTranscript := config{fps: 2, mode: "frames", format: "png", quality: 85, output: ".", transcriptLocale: "en-GB"}
+	if err := normalizeConfig(&localeWithoutTranscript); err == nil || !strings.Contains(err.Error(), "--transcript") {
+		t.Fatalf("expected locale without transcript to fail, got %v", err)
+	}
 }
 
 func TestWriteImageJPEG(t *testing.T) {
@@ -110,5 +176,43 @@ func TestPrepareOutputDirOverwriteGuard(t *testing.T) {
 	}
 	if _, err := os.Stat(existing); !os.IsNotExist(err) {
 		t.Fatalf("existing file should be removed with overwrite, stat err=%v", err)
+	}
+}
+
+func TestGeneratedFilePatternsIncludeAudioArtifacts(t *testing.T) {
+	patterns := strings.Join(generatedFilePatterns("out"), "\n")
+	for _, name := range []string{"audio.wav", "transcript.txt", "transcript.json"} {
+		if !strings.Contains(patterns, name) {
+			t.Fatalf("generated patterns do not include %s", name)
+		}
+	}
+}
+
+func TestTimedArtifactValidation(t *testing.T) {
+	a := 0.02
+	b := 0.52
+	timeline := []frameTiming{
+		{Index: 0, CaptureOffsetSeconds: 0, AudioOffsetSeconds: &a},
+		{Index: 1, CaptureOffsetSeconds: 0.5, AudioOffsetSeconds: &b},
+	}
+	if err := validateFrameTimeline(timeline, 1); err != nil {
+		t.Fatalf("valid frame timeline: %v", err)
+	}
+	bad := -0.1
+	timeline[1].AudioOffsetSeconds = &bad
+	if err := validateFrameTimeline(timeline, 1); err == nil {
+		t.Fatal("expected unordered/negative frame timeline to fail")
+	}
+
+	doc := transcriptDocument{Segments: []transcriptSegment{
+		{StartSeconds: 0.1, EndSeconds: 0.3, Text: "hello"},
+		{StartSeconds: 0.4, EndSeconds: 0.8, Text: "world"},
+	}}
+	if err := validateTranscriptDocument(doc, 1); err != nil {
+		t.Fatalf("valid transcript: %v", err)
+	}
+	doc.Segments[1].StartSeconds = 0.05
+	if err := validateTranscriptDocument(doc, 1); err == nil {
+		t.Fatal("expected unordered transcript to fail")
 	}
 }

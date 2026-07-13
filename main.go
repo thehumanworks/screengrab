@@ -24,23 +24,26 @@ import (
 const defaultFPS = 2.0
 
 type config struct {
-	fps         float64
-	duration    time.Duration
-	frames      int
-	output      string
-	mode        string
-	format      string
-	quality     int
-	display     int
-	source      string
-	region      string
-	maxDim      int
-	cols        int
-	gui         bool
-	devtools    bool
-	listSources bool
-	json        bool
-	overwrite   bool
+	fps              float64
+	duration         time.Duration
+	frames           int
+	output           string
+	mode             string
+	format           string
+	quality          int
+	display          int
+	source           string
+	region           string
+	maxDim           int
+	cols             int
+	gui              bool
+	devtools         bool
+	listSources      bool
+	json             bool
+	overwrite        bool
+	microphone       bool
+	transcript       bool
+	transcriptLocale string
 }
 
 type regionSpec struct {
@@ -51,61 +54,76 @@ type regionSpec struct {
 }
 
 type captureManifest struct {
-	OK              bool         `json:"ok"`
-	Version         int          `json:"version"`
-	Source          Source       `json:"source"`
-	Mode            string       `json:"mode"`
-	Output          string       `json:"output"`
-	ManifestPath    string       `json:"manifest_path"`
-	Format          string       `json:"format"`
-	Quality         int          `json:"quality,omitempty"`
-	FPS             float64      `json:"fps"`
-	Duration        string       `json:"duration,omitempty"`
-	RequestedFrames int          `json:"requested_frames,omitempty"`
-	CapturedFrames  int          `json:"captured_frames"`
-	Region          *regionSpec  `json:"region,omitempty"`
-	MaxDim          int          `json:"max_dim,omitempty"`
-	FrameWidth      int          `json:"frame_width,omitempty"`
-	FrameHeight     int          `json:"frame_height,omitempty"`
-	FirstFile       string       `json:"first_file,omitempty"`
-	LastFile        string       `json:"last_file,omitempty"`
-	StartedAt       string       `json:"started_at"`
-	FinishedAt      string       `json:"finished_at"`
-	ElapsedSeconds  float64      `json:"elapsed_seconds"`
-	Files           []outputFile `json:"files"`
-	Spritesheet     *sheetMeta   `json:"spritesheet,omitempty"`
+	OK              bool                `json:"ok"`
+	Partial         bool                `json:"partial,omitempty"`
+	Version         int                 `json:"version"`
+	Source          Source              `json:"source"`
+	Mode            string              `json:"mode"`
+	Output          string              `json:"output"`
+	ManifestPath    string              `json:"manifest_path"`
+	Format          string              `json:"format"`
+	Quality         int                 `json:"quality,omitempty"`
+	FPS             float64             `json:"fps"`
+	Duration        string              `json:"duration,omitempty"`
+	RequestedFrames int                 `json:"requested_frames,omitempty"`
+	CapturedFrames  int                 `json:"captured_frames"`
+	Region          *regionSpec         `json:"region,omitempty"`
+	MaxDim          int                 `json:"max_dim,omitempty"`
+	FrameWidth      int                 `json:"frame_width,omitempty"`
+	FrameHeight     int                 `json:"frame_height,omitempty"`
+	FirstFile       string              `json:"first_file,omitempty"`
+	LastFile        string              `json:"last_file,omitempty"`
+	StartedAt       string              `json:"started_at"`
+	FinishedAt      string              `json:"finished_at"`
+	ElapsedSeconds  float64             `json:"elapsed_seconds"`
+	Files           []outputFile        `json:"files"`
+	FrameTimeline   []frameTiming       `json:"frame_timeline,omitempty"`
+	Spritesheet     *sheetMeta          `json:"spritesheet,omitempty"`
+	Audio           *audioArtifact      `json:"audio,omitempty"`
+	Transcript      *transcriptArtifact `json:"transcript,omitempty"`
 }
 
 type captureSummary struct {
-	OK              bool        `json:"ok"`
-	Version         int         `json:"version"`
-	Source          Source      `json:"source"`
-	Mode            string      `json:"mode"`
-	Output          string      `json:"output"`
-	ManifestPath    string      `json:"manifest_path"`
-	Format          string      `json:"format"`
-	Quality         int         `json:"quality,omitempty"`
-	FPS             float64     `json:"fps"`
-	Duration        string      `json:"duration,omitempty"`
-	RequestedFrames int         `json:"requested_frames,omitempty"`
-	CapturedFrames  int         `json:"captured_frames"`
-	Region          *regionSpec `json:"region,omitempty"`
-	MaxDim          int         `json:"max_dim,omitempty"`
-	FrameWidth      int         `json:"frame_width,omitempty"`
-	FrameHeight     int         `json:"frame_height,omitempty"`
-	FirstFile       string      `json:"first_file,omitempty"`
-	LastFile        string      `json:"last_file,omitempty"`
-	ElapsedSeconds  float64     `json:"elapsed_seconds"`
-	Spritesheet     *sheetMeta  `json:"spritesheet,omitempty"`
+	OK              bool                `json:"ok"`
+	Partial         bool                `json:"partial,omitempty"`
+	Version         int                 `json:"version"`
+	Source          Source              `json:"source"`
+	Mode            string              `json:"mode"`
+	Output          string              `json:"output"`
+	ManifestPath    string              `json:"manifest_path"`
+	Format          string              `json:"format"`
+	Quality         int                 `json:"quality,omitempty"`
+	FPS             float64             `json:"fps"`
+	Duration        string              `json:"duration,omitempty"`
+	RequestedFrames int                 `json:"requested_frames,omitempty"`
+	CapturedFrames  int                 `json:"captured_frames"`
+	Region          *regionSpec         `json:"region,omitempty"`
+	MaxDim          int                 `json:"max_dim,omitempty"`
+	FrameWidth      int                 `json:"frame_width,omitempty"`
+	FrameHeight     int                 `json:"frame_height,omitempty"`
+	FirstFile       string              `json:"first_file,omitempty"`
+	LastFile        string              `json:"last_file,omitempty"`
+	ElapsedSeconds  float64             `json:"elapsed_seconds"`
+	Spritesheet     *sheetMeta          `json:"spritesheet,omitempty"`
+	Audio           *audioArtifact      `json:"audio,omitempty"`
+	Transcript      *transcriptArtifact `json:"transcript,omitempty"`
 }
 
 type outputFile struct {
-	Path   string `json:"path"`
-	Type   string `json:"type"`
-	Index  int    `json:"index"`
-	Width  int    `json:"width,omitempty"`
-	Height int    `json:"height,omitempty"`
-	Bytes  int64  `json:"bytes"`
+	Path                 string   `json:"path"`
+	Type                 string   `json:"type"`
+	Index                int      `json:"index"`
+	Width                int      `json:"width,omitempty"`
+	Height               int      `json:"height,omitempty"`
+	Bytes                int64    `json:"bytes"`
+	CaptureOffsetSeconds *float64 `json:"capture_offset_seconds,omitempty"`
+	AudioOffsetSeconds   *float64 `json:"audio_offset_seconds,omitempty"`
+}
+
+type frameTiming struct {
+	Index                int      `json:"index"`
+	CaptureOffsetSeconds float64  `json:"capture_offset_seconds"`
+	AudioOffsetSeconds   *float64 `json:"audio_offset_seconds,omitempty"`
 }
 
 func main() {
@@ -188,6 +206,9 @@ func parseFlags() config {
 	flag.BoolVar(&cfg.listSources, "list-sources", false, "print every capturable source (displays and macOS windows) and exit")
 	flag.BoolVar(&cfg.json, "json", false, "emit machine-readable JSON for --list-sources and final capture summary")
 	flag.BoolVar(&cfg.overwrite, "overwrite", false, "allow replacing generated files already present in the output directory")
+	flag.BoolVar(&cfg.microphone, "microphone", false, "record the default microphone to audio.wav (macOS)")
+	flag.BoolVar(&cfg.transcript, "transcript", false, "generate transcript.txt and timed transcript.json; requires --microphone")
+	flag.StringVar(&cfg.transcriptLocale, "transcript-locale", "", "speech-recognition locale (default: system locale); requires --transcript")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage: screengrab [flags]\n\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "Records the screen at a fixed FPS and outputs frames or a spritesheet.\n")
@@ -224,6 +245,12 @@ func normalizeConfig(cfg *config) error {
 	}
 	if cfg.cols < 0 {
 		return fmt.Errorf("--cols must be >= 0 (got %d)", cfg.cols)
+	}
+	if cfg.transcript && !cfg.microphone {
+		return errors.New("--transcript requires --microphone")
+	}
+	if cfg.transcriptLocale != "" && !cfg.transcript {
+		return errors.New("--transcript-locale requires --transcript")
 	}
 	absOutput, err := filepath.Abs(cfg.output)
 	if err != nil {
@@ -292,6 +319,9 @@ func generatedFilePatterns(output string) []string {
 		filepath.Join(output, "spritesheet.jpeg"),
 		filepath.Join(output, "spritesheet.json"),
 		filepath.Join(output, "manifest.json"),
+		filepath.Join(output, "audio.wav"),
+		filepath.Join(output, "transcript.txt"),
+		filepath.Join(output, "transcript.json"),
 	}
 }
 
@@ -387,6 +417,47 @@ func plannedFrameCount(fps float64, duration time.Duration, maxFrames int) int {
 	return targetFrames
 }
 
+func runCaptureLoop(targetFrames int, ticks <-chan time.Time, stopCh <-chan os.Signal, captureOne func() (bool, error)) (bool, error) {
+	capturedFrames := 0
+	for {
+		captured, err := captureOne()
+		if err != nil {
+			return false, err
+		}
+		if captured {
+			capturedFrames++
+			if targetFrames > 0 && capturedFrames >= targetFrames {
+				return false, nil
+			}
+		}
+
+		select {
+		case <-stopCh:
+			return true, nil
+		case <-ticks:
+		}
+	}
+}
+
+func windowSourceStillExists(src Source) bool {
+	if src.Kind != SourceKindWindow {
+		return false
+	}
+	id, err := parseWindowID(strings.TrimPrefix(src.ID, SourceKindWindow+":"))
+	return err == nil && macWindowExists(id)
+}
+
+func captureCLIFrame(src Source, capture func() (*image.RGBA, error), stillExists func(Source) bool) (*image.RGBA, bool, error) {
+	img, err := capture()
+	if err == nil {
+		return img, true, nil
+	}
+	if src.Kind == SourceKindWindow && stillExists(src) {
+		return nil, false, nil
+	}
+	return nil, false, err
+}
+
 func firstLastFile(files []outputFile) (string, string) {
 	if len(files) == 0 {
 		return "", ""
@@ -409,6 +480,7 @@ func firstOutputDimensions(files []outputFile, sheet *sheetMeta) (int, int) {
 func summaryFromManifest(m captureManifest) captureSummary {
 	return captureSummary{
 		OK:              m.OK,
+		Partial:         m.Partial,
 		Version:         m.Version,
 		Source:          m.Source,
 		Mode:            m.Mode,
@@ -428,12 +500,26 @@ func summaryFromManifest(m captureManifest) captureSummary {
 		LastFile:        m.LastFile,
 		ElapsedSeconds:  m.ElapsedSeconds,
 		Spritesheet:     m.Spritesheet,
+		Audio:           m.Audio,
+		Transcript:      m.Transcript,
 	}
 }
 
 func run(cfg config) error {
 	if err := normalizeConfig(&cfg); err != nil {
 		return err
+	}
+	resolvedTranscriptLocale := cfg.transcriptLocale
+	var transcriptPreflightErr error
+	if cfg.transcript {
+		locale, err := prepareTranscription(cfg.transcriptLocale)
+		resolvedTranscriptLocale = locale
+		if err != nil {
+			if !errors.Is(err, errTranscriptionUnavailable) {
+				return err
+			}
+			transcriptPreflightErr = err
+		}
 	}
 	src, err := resolveCLISource(cfg)
 	if err != nil {
@@ -446,12 +532,35 @@ func run(cfg config) error {
 	if region != nil && (region.X+region.Width > src.Width || region.Y+region.Height > src.Height) {
 		return fmt.Errorf("--region %d,%d,%d,%d exceeds source bounds %dx%d", region.X, region.Y, region.Width, region.Height, src.Width, src.Height)
 	}
-	if err := os.MkdirAll(cfg.output, 0o755); err != nil {
+	outputMode := os.FileMode(0o755)
+	if cfg.microphone {
+		outputMode = 0o700
+	}
+	if err := os.MkdirAll(cfg.output, outputMode); err != nil {
 		return fmt.Errorf("create output dir: %w", err)
+	}
+	if cfg.microphone {
+		if err := os.Chmod(cfg.output, 0o700); err != nil {
+			return fmt.Errorf("secure output dir: %w", err)
+		}
 	}
 	if err := prepareOutputDir(cfg); err != nil {
 		return err
 	}
+
+	var mic *microphoneRecorder
+	if cfg.microphone {
+		mic, err = startMicrophoneRecorder(filepath.Join(cfg.output, "audio.wav"))
+		if err != nil {
+			return err
+		}
+	}
+	micStopped := false
+	defer func() {
+		if mic != nil && !micStopped {
+			_, _ = mic.Stop()
+		}
+	}()
 
 	interval := time.Duration(float64(time.Second) / cfg.fps)
 
@@ -481,70 +590,125 @@ func run(cfg config) error {
 
 	frames := []*image.RGBA{} // only used by spritesheet mode
 	files := []outputFile{}
+	timeline := []frameTiming{}
 	frameCount := 0
 	start := time.Now()
 
-	captureOne := func() error {
-		var img *image.RGBA
-		var err error
-		if region != nil {
-			img, err = captureSourceRegion(src, region.X, region.Y, region.Width, region.Height)
-		} else {
-			img, err = captureSource(src)
+	waitingForWindow := false
+	captureOne := func() (bool, error) {
+		captureOffset := time.Since(start).Seconds()
+		var audioOffset *float64
+		if mic != nil {
+			current := mic.CurrentTime()
+			audioOffset = &current
 		}
+		capture := func() (*image.RGBA, error) {
+			if region != nil {
+				return captureSourceRegion(src, region.X, region.Y, region.Width, region.Height)
+			}
+			return captureSource(src)
+		}
+		img, captured, err := captureCLIFrame(src, capture, windowSourceStillExists)
 		if err != nil {
-			return err
+			return false, err
+		}
+		if !captured {
+			if !waitingForWindow {
+				logf("screengrab: waiting for %s; switch to its macOS Space if it is not visible\n", src.ID)
+				waitingForWindow = true
+			}
+			return false, nil
+		}
+		if waitingForWindow {
+			logf("screengrab: %s is live; capture resumed\n", src.ID)
+			waitingForWindow = false
 		}
 		img = fitToMaxDim(img, cfg.maxDim)
 		if file, err := handleFrame(cfg, img, frameCount, &frames); err != nil {
-			return err
+			return false, err
 		} else if file != nil {
+			file.CaptureOffsetSeconds = &captureOffset
+			file.AudioOffsetSeconds = audioOffset
 			files = append(files, *file)
 		}
+		timeline = append(timeline, frameTiming{Index: frameCount, CaptureOffsetSeconds: captureOffset, AudioOffsetSeconds: audioOffset})
 		frameCount++
-		return nil
+		return true, nil
 	}
 
-	// Capture one frame immediately at t=0 so a short duration still yields frames.
-	if err := captureOne(); err != nil {
-		return err
-	}
-
-loop:
-	for {
-		if targetFrames > 0 && frameCount >= targetFrames {
-			break loop
-		}
-		select {
-		case <-stopCh:
-			logf("screengrab: SIGINT received, stopping\n")
-			break loop
-		case <-ticker.C:
-			if err := captureOne(); err != nil {
-				return err
-			}
-		}
+	// The loop attempts one frame immediately at t=0 so a short duration still
+	// yields frames. A still-existing window can temporarily have no compositor
+	// frame while it is on another Space; those misses do not consume the target.
+	stopped, captureErr := runCaptureLoop(targetFrames, ticker.C, stopCh, captureOne)
+	if stopped {
+		logf("screengrab: SIGINT received, stopping\n")
 	}
 
 	finished := time.Now()
 	elapsed := finished.Sub(start)
 	logf("screengrab: captured %d frames in %v\n", frameCount, elapsed.Round(time.Millisecond))
 
-	var sheet *sheetMeta
-	if cfg.mode == "spritesheet" {
-		if frameCount == 0 {
-			return errors.New("no frames captured; nothing to composite")
+	var audio *audioArtifact
+	var audioErr error
+	if mic != nil {
+		artifact, stopErr := mic.Stop()
+		micStopped = true
+		audio = &artifact
+		audioErr = stopErr
+		if stopErr == nil {
+			if err := validateFrameTimeline(timeline, artifact.DurationSeconds); err != nil {
+				audioErr = err
+				audio.Status = "failed"
+				audio.Error = err.Error()
+			}
 		}
-		meta, sheetFiles, err := writeSpritesheet(cfg, frames)
-		if err != nil {
-			return fmt.Errorf("write spritesheet: %w", err)
-		}
-		sheet = &meta
-		files = append(files, sheetFiles...)
 	}
+
+	var transcript *transcriptArtifact
+	var transcriptErr error
+	if cfg.transcript && audioErr == nil {
+		if transcriptPreflightErr != nil {
+			doc := transcriptDocument{
+				Version:  1,
+				Status:   "unavailable",
+				Locale:   resolvedTranscriptLocale,
+				Segments: []transcriptSegment{},
+				Error:    transcriptPreflightErr.Error(),
+			}
+			jsonPath := filepath.Join(cfg.output, "transcript.json")
+			if err := writePrivateJSON(jsonPath, doc); err != nil {
+				transcriptErr = err
+			} else {
+				transcript = &transcriptArtifact{JSONPath: jsonPath, Locale: resolvedTranscriptLocale, Status: "unavailable", Error: transcriptPreflightErr.Error()}
+				transcriptErr = transcriptPreflightErr
+			}
+		} else {
+			transcript, transcriptErr = transcribeAndWrite(audio.Path, cfg.output, resolvedTranscriptLocale, audio.DurationSeconds)
+		}
+		if transcriptErr != nil {
+			logf("screengrab: transcription incomplete: %v\n", transcriptErr)
+		}
+	}
+
+	var sheet *sheetMeta
+	if cfg.mode == "spritesheet" && captureErr == nil {
+		if frameCount == 0 {
+			captureErr = errors.New("no frames captured; nothing to composite")
+		} else {
+			meta, sheetFiles, sheetErr := writeSpritesheet(cfg, frames)
+			if sheetErr != nil {
+				captureErr = fmt.Errorf("write spritesheet: %w", sheetErr)
+			} else {
+				sheet = &meta
+				files = append(files, sheetFiles...)
+			}
+		}
+	}
+	ok := captureErr == nil && audioErr == nil && transcriptErr == nil
 	manifest := captureManifest{
-		OK:              true,
-		Version:         1,
+		OK:              ok,
+		Partial:         !ok && (frameCount > 0 || audio != nil),
+		Version:         2,
 		Source:          src,
 		Mode:            cfg.mode,
 		Output:          cfg.output,
@@ -559,7 +723,10 @@ loop:
 		FinishedAt:      finished.Format(time.RFC3339Nano),
 		ElapsedSeconds:  elapsed.Seconds(),
 		Files:           files,
+		FrameTimeline:   timeline,
 		Spritesheet:     sheet,
+		Audio:           audio,
+		Transcript:      transcript,
 	}
 	manifest.FirstFile, manifest.LastFile = firstLastFile(files)
 	manifest.FrameWidth, manifest.FrameHeight = firstOutputDimensions(files, sheet)
@@ -572,8 +739,21 @@ loop:
 	if err := writeManifest(manifest.ManifestPath, manifest); err != nil {
 		return fmt.Errorf("write manifest: %w", err)
 	}
+	if cfg.microphone {
+		if err := os.Chmod(manifest.ManifestPath, 0o600); err != nil {
+			return fmt.Errorf("secure manifest: %w", err)
+		}
+	}
 	if cfg.json {
-		return json.NewEncoder(os.Stdout).Encode(summaryFromManifest(manifest))
+		if err := json.NewEncoder(os.Stdout).Encode(summaryFromManifest(manifest)); err != nil {
+			return err
+		}
+	}
+	if captureErr != nil {
+		return captureErr
+	}
+	if audioErr != nil {
+		return audioErr
 	}
 	return nil
 }

@@ -14,6 +14,10 @@ const state = {
   region: { x: 0, y: 0, width: 0, height: 0 },
   framePaths: [],
   selected: new Set(),
+  microphone: false,
+  transcript: false,
+  transcriptLocale: "",
+  recordingStatus: null,
 };
 
 // ─── view switching ──────────────────────────────────────────────────────
@@ -101,6 +105,10 @@ async function initSetup() {
   sel.value = state.sourceId;
   $("fpsInput").value = state.fps;
   $("outputInput").value = state.output;
+	$("microphoneInput").checked = state.microphone;
+	$("transcriptInput").checked = state.transcript;
+	$("transcriptLocaleInput").value = state.transcriptLocale;
+	$("transcriptLocaleInput").disabled = !state.transcript;
   renderRegionSummary();
 }
 
@@ -155,6 +163,9 @@ function commitSetupForm() {
   if (!Number.isNaN(fpsRaw) && fpsRaw > 0) state.fps = fpsRaw;
   const out = $("outputInput").value.trim();
   if (out) state.output = out;
+	state.microphone = $("microphoneInput").checked;
+	state.transcript = $("transcriptInput").checked;
+	state.transcriptLocale = $("transcriptLocaleInput").value.trim();
 }
 
 // ─── region picker ───────────────────────────────────────────────────────
@@ -171,13 +182,11 @@ async function showRegionPicker() {
 
   const src = currentSource();
   if (src && src.kind === "window" && !src.on_screen) {
-    // No public macOS API can snapshot an off-Space window — the
-    // compositor isn't rendering it, so even Apple's screencapture
-    // tool returns "could not create image from window". Tell the
-    // user honestly and offer to skip the picker.
+    // An off-Space window does not reliably have a capture-ready frame.
+    // Skip the picker's one-shot snapshot; the recording loop can retry.
     toast(
       `“${src.name}” is on another macOS Space. Swipe over to it to preview a region. ` +
-      `You can still record the full window — recording will catch up the moment you swipe.`,
+      `You can still record the full window — recording will retry until it is available.`,
       6000,
     );
     showView("setup");
@@ -309,6 +318,7 @@ async function startRecording() {
   commitSetupForm();
   state.framePaths = [];
   state.selected.clear();
+  state.recordingStatus = null;
 
   const src = currentSource();
   if (src && src.kind === "window") {
@@ -325,6 +335,8 @@ async function startRecording() {
   setSubtitle("recording");
   $("recElapsed").textContent = "0.0s";
   $("recFrames").textContent = "0";
+	$("recAudio").textContent = state.microphone ? "On" : "Off";
+	$("recordingSub").textContent = "Press Stop when you are done; partial output is preserved.";
 
   try {
     await svc("StartRecording", {
@@ -335,6 +347,9 @@ async function startRecording() {
       width: state.region.width,
       height: state.region.height,
       output: state.output,
+	  microphone: state.microphone,
+	  transcript: state.transcript,
+	  transcript_locale: state.transcriptLocale,
     });
   } catch (e) {
     toast(`Start failed: ${e?.message ?? e}`);
@@ -348,6 +363,12 @@ async function startRecording() {
       $("recElapsed").textContent = s.elapsed.toFixed(1) + "s";
       $("recFrames").textContent = String(s.frame_count);
       state.framePaths = s.frame_paths || [];
+	  state.recordingStatus = s;
+	  $("recAudio").textContent = s.microphone ? "On" : "Off";
+	  if (s.transcribing) {
+		setSubtitle("transcribing");
+		$("recordingSub").textContent = "Screen and microphone capture are complete. Creating the on-device transcript…";
+	  }
       if (!s.recording) {
         clearInterval(recordingTimerHandle);
         recordingTimerHandle = null;
@@ -370,6 +391,25 @@ async function showReview() {
 
   const summary = $("reviewSummary");
   summary.textContent = `${state.framePaths.length} frame${state.framePaths.length === 1 ? "" : "s"} captured.`;
+
+	const artifacts = $("reviewArtifacts");
+	const status = state.recordingStatus;
+	if (status && (status.audio_path || status.transcript_status)) {
+	  artifacts.hidden = false;
+	  $("reviewAudioPath").textContent = status.audio_path || "not available";
+	  $("reviewTranscriptStatus").textContent = status.transcript_status || "not requested";
+	  const text = $("reviewTranscriptText");
+	  text.hidden = true;
+	  text.textContent = "";
+	  if (status.transcript_status === "complete") {
+		svc("TranscriptText").then((value) => {
+		  text.textContent = value;
+		  text.hidden = false;
+		}).catch(() => {});
+	  }
+	} else {
+	  artifacts.hidden = true;
+	}
 
   const grid = $("reviewGrid");
   grid.innerHTML = "";
@@ -415,7 +455,8 @@ async function saveSelected() {
   const indices = Array.from(state.selected).sort((a, b) => a - b);
   try {
     const dest = await svc("SaveSelected", indices, state.output);
-    toast(`Saved ${indices.length} frames to ${dest} — path copied.`);
+    const associated = state.recordingStatus?.audio_path ? " with associated audio and transcript artifacts" : "";
+    toast(`Saved ${indices.length} frames${associated} to ${dest} — path copied.`);
   } catch (e) {
     toast(`Save failed: ${e?.message ?? e}`);
   }
@@ -441,6 +482,17 @@ document.addEventListener("DOMContentLoaded", async () => {
     toast("Region reset to full display.");
   });
   $("startBtn").addEventListener("click", startRecording);
+
+	$("microphoneInput").addEventListener("change", () => {
+	  if (!$("microphoneInput").checked) {
+		$("transcriptInput").checked = false;
+		$("transcriptLocaleInput").disabled = true;
+	  }
+	});
+	$("transcriptInput").addEventListener("change", () => {
+	  if ($("transcriptInput").checked) $("microphoneInput").checked = true;
+	  $("transcriptLocaleInput").disabled = !$("transcriptInput").checked;
+	});
 
   $("regionConfirmBtn").addEventListener("click", () => {
     renderRegionSummary();
@@ -500,4 +552,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
   });
   Events.On("capture:complete", () => { /* status polling handles transition */ });
+	Events.On("capture:transcript_error", (ev) => {
+	  toast(`Transcript incomplete: ${ev.data}`, 5000);
+	});
 });

@@ -109,13 +109,17 @@ verify: build ## Run every contract criterion end-to-end.
 	  ./$(BINARY) --help 2>&1 | grep -qE '\-max-dim' && \
 	  ./$(BINARY) --help 2>&1 | grep -qE '\-format' && \
 	  ./$(BINARY) --help 2>&1 | grep -qE '\-quality' && \
-	  ./$(BINARY) --help 2>&1 | grep -qE '\-overwrite'
+	  ./$(BINARY) --help 2>&1 | grep -qE '\-overwrite' && \
+	  ./$(BINARY) --help 2>&1 | grep -qE '\-microphone' && \
+	  ./$(BINARY) --help 2>&1 | grep -qE '\-transcript' && \
+	  ./$(BINARY) --help 2>&1 | grep -qE '\-transcript-locale'
 	@echo "→ C3: defaultFPS ≤ 4"
 	@grep -qE '^const defaultFPS = ([0-4](\.[0-9]+)?)$$' main.go
 	@echo "→ C4: frames mode produces fps*duration PNGs"
 	@rm -rf out_frames && ./$(BINARY) --duration 2s --fps 2 --mode frames --output out_frames >/dev/null
 	@count=$$(ls out_frames/*.png 2>/dev/null | wc -l | tr -d ' ') && \
 	  [ "$$count" = "4" ] || (echo "expected 4 frames, got $$count" && exit 1)
+	@test ! -e out_frames/audio.wav && test ! -e out_frames/transcript.txt && test ! -e out_frames/transcript.json
 	@echo "→ C5: spritesheet mode produces png + json"
 	@rm -rf out_sheet && ./$(BINARY) --duration 2s --fps 2 --mode spritesheet --output out_sheet >/dev/null
 	@test -f out_sheet/spritesheet.png && test -f out_sheet/spritesheet.json
@@ -134,6 +138,11 @@ verify: build ## Run every contract criterion end-to-end.
 	@$(GO) test -count=1 -ldflags '$(LDFLAGS)' ./... >/dev/null
 	@echo "→ C26-C30: agent-ready CLI controls"
 	@$(GO) test -count=1 -ldflags '$(LDFLAGS)' ./... -run 'Test(ParseRegionSpec|PlannedFrameCountCapsDuration|FitToMaxDim|NormalizeConfigFormatAndValidation|WriteImageJPEG|PrepareOutputDirOverwriteGuard)' >/dev/null
+	@echo "→ C31-C34: synchronized microphone and transcript artifacts"
+	@grep -qE 'AVAudioEngine' mac_audio.go
+	@grep -qE 'SFSpeechURLRecognitionRequest' mac_transcript.go
+	@grep -qE 'requiresOnDeviceRecognition' mac_transcript.go
+	@$(GO) test -count=1 -ldflags '$(LDFLAGS)' ./... -run 'Test(GeneratedFilePatternsIncludeAudioArtifacts|TimedArtifactValidation|CopySelectedCapturePreservesAssociatedArtifacts|CaptureServiceBindingsMatchFrontend)' >/dev/null
 	@echo "→ C12: frontend is embedded"
 	@grep -qE '^//go:embed.*frontend' gui.go
 	@echo "→ C13: CSS Liquid Glass + a11y fallbacks"
@@ -180,9 +189,12 @@ app: build-release ## Package a minimal screengrab.app bundle on macOS.
   <key>LSMinimumSystemVersion</key><string>26.0</string>\n\
   <key>NSHighResolutionCapable</key><true/>\n\
   <key>NSScreenCaptureUsageDescription</key><string>screengrab samples the screen for AI ingestion.</string>\n\
+  <key>NSMicrophoneUsageDescription</key><string>screengrab records microphone narration alongside screen captures when you enable it.</string>\n\
+  <key>NSSpeechRecognitionUsageDescription</key><string>screengrab creates a local text transcript from recorded microphone audio when you enable it.</string>\n\
 </dict>\n\
 </plist>\n' > "$(APP_DIR)/Contents/Info.plist"
-	@echo "→ built $(APP_DIR) (run /usr/bin/codesign to sign, then xcrun notarytool to notarize)"
+	@/usr/bin/codesign --force --deep --sign - "$(APP_DIR)"
+	@echo "→ built $(APP_DIR) with an ad-hoc signature (use a Developer ID signature and notarization for distribution)"
 
 # ─── Cleanup ────────────────────────────────────────────────────────────
 

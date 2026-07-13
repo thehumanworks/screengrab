@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"image"
 	"image/color"
 	"image/png"
@@ -100,6 +101,91 @@ func TestCopyFramesCreatesDestDir(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dst, "frame_0000.png")); err != nil {
 		t.Fatalf("expected destination file present: %v", err)
+	}
+}
+
+func TestCopySelectedCapturePreservesAssociatedArtifacts(t *testing.T) {
+	src := t.TempDir()
+	frames := make([]outputFile, 0, 3)
+	for i := 0; i < 3; i++ {
+		path := filepath.Join(src, "frame_"+padN(i)+".png")
+		writeTinyPNG(t, path, color.RGBA{R: uint8(30 * i), G: 20, B: 40, A: 255})
+		captureOffset := float64(i) * 0.5
+		audioOffset := captureOffset + 0.03
+		frames = append(frames, outputFile{
+			Path:                 path,
+			Type:                 "frame",
+			Index:                i,
+			CaptureOffsetSeconds: &captureOffset,
+			AudioOffsetSeconds:   &audioOffset,
+		})
+	}
+	audioPath := filepath.Join(src, "audio.wav")
+	textPath := filepath.Join(src, "transcript.txt")
+	jsonPath := filepath.Join(src, "transcript.json")
+	if err := os.WriteFile(audioPath, []byte("audio"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(textPath, []byte("hello world\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(jsonPath, []byte(`{"version":1,"status":"complete"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := captureManifest{
+		OK:             true,
+		Version:        2,
+		Output:         src,
+		ManifestPath:   filepath.Join(src, "manifest.json"),
+		CapturedFrames: len(frames),
+		Files:          frames,
+		FrameTimeline:  frameTimelineFromFiles(frames),
+		Audio:          &audioArtifact{Path: audioPath, Format: "wav", Codec: "pcm-s16le", Status: "complete", DurationSeconds: 2},
+		Transcript:     &transcriptArtifact{TextPath: textPath, JSONPath: jsonPath, Locale: "en-GB", Status: "complete"},
+	}
+
+	dest := filepath.Join(t.TempDir(), "selected")
+	if err := copySelectedCapture(manifest, []int{0, 2}, dest); err != nil {
+		t.Fatalf("copySelectedCapture: %v", err)
+	}
+	for _, name := range []string{"frame_0000.png", "frame_0001.png", "audio.wav", "transcript.txt", "transcript.json", "manifest.json"} {
+		if _, err := os.Stat(filepath.Join(dest, name)); err != nil {
+			t.Fatalf("missing %s: %v", name, err)
+		}
+	}
+
+	raw, err := os.ReadFile(filepath.Join(dest, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got captureManifest
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode selected manifest: %v", err)
+	}
+	if got.Version != 2 || got.CapturedFrames != 2 || len(got.Files) != 2 {
+		t.Fatalf("selected manifest = version %d, frames %d/%d", got.Version, got.CapturedFrames, len(got.Files))
+	}
+	if got.Files[0].Index != 0 || got.Files[1].Index != 2 {
+		t.Fatalf("selected source indices = %d,%d, want 0,2", got.Files[0].Index, got.Files[1].Index)
+	}
+	if len(got.FrameTimeline) != 2 || got.FrameTimeline[1].Index != 2 {
+		t.Fatalf("selected frame timeline = %+v", got.FrameTimeline)
+	}
+	if got.Files[1].AudioOffsetSeconds == nil || *got.Files[1].AudioOffsetSeconds != 1.03 {
+		t.Fatalf("selected audio offset was not preserved: %+v", got.Files[1].AudioOffsetSeconds)
+	}
+	if got.Audio == nil || got.Audio.Path != filepath.Join(dest, "audio.wav") {
+		t.Fatalf("selected audio association = %+v", got.Audio)
+	}
+	if got.Transcript == nil || got.Transcript.TextPath != filepath.Join(dest, "transcript.txt") {
+		t.Fatalf("selected transcript association = %+v", got.Transcript)
+	}
+	info, err := os.Stat(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("selected private directory mode = %o, want 700", info.Mode().Perm())
 	}
 }
 

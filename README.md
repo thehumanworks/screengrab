@@ -48,6 +48,9 @@ The resulting `./screengrab` is a self-contained binary. On macOS arm64 it is ar
 
 # Record a single macOS window by its ID from --list-sources
 ./screengrab --duration 4s --source window:0x21cb --output window-clip
+
+# Record microphone narration and create a timed, on-device transcript
+./screengrab --duration 10s --microphone --transcript --output narrated-capture
 ```
 
 ## Flags
@@ -69,6 +72,9 @@ The resulting `./screengrab` is a self-contained binary. On macOS arm64 it is ar
 | `--cols` | `0` (auto) | Columns in spritesheet grid; defaults to `ceil(sqrt(frame_count))`. |
 | `--json` | `false` | Emit machine-readable JSON for `--list-sources` and final capture summaries. Capture summaries point to `manifest.json` for the full file list. |
 | `--overwrite` | `false` | Allow replacing generated files already present in the output directory. Without this, existing `frame_*`, `spritesheet.*`, or `manifest.json` files cause a fail-fast error. |
+| `--microphone` | `false` | Record the current default microphone as 16-bit PCM `audio.wav` on macOS. Audio recording is opt-in. |
+| `--transcript` | `false` | Create `transcript.txt` and timed `transcript.json` from the recorded microphone using on-device recognition. Requires `--microphone`. |
+| `--transcript-locale` | system locale | Recognition locale such as `en-GB` or `en-US`. Requires `--transcript`. |
 | `--gui` | `false` | Launch the cross-platform desktop GUI instead of the headless CLI flow. |
 | `--devtools` | `false` | Open the webview developer tools panel when `--gui` is set. |
 
@@ -80,10 +86,11 @@ Run `./screengrab --gui` to open the desktop view, powered by [Wails v3](https:/
 
 The flow is:
 
-1. **Setup**: pick a capture source from the dropdown — the list is grouped into *Displays* (physical screens) and *Windowed apps*, where each window is labelled with its owning application. A maximized macOS app on its own Space appears in the windowed-apps group, so you can record it without having to swipe over there first. Then set the FPS, set the output base directory, and either *Pick Region* to drag a rectangle on a preview of the source, or *Use Full Source*.
-2. **Recording**: click *Start Recording*; the GUI captures at the configured FPS into a timestamped sub-directory of the output base. Press *Stop Recording* when done.
-3. **Review**: every captured frame appears as a thumbnail in a grid. Click to toggle selection, or use *Select All* / *Clear*.
-4. **Save**: click *Save Selected & Copy Path*. The selected frames are copied to a new `selected-YYYYMMDD-HHMMSS/` sub-directory and the absolute path is written to the system clipboard for pasting into your next tool (e.g. an LLM chat).
+1. **Setup**: pick a capture source from the dropdown — the list is grouped into *Displays* (physical screens) and *Windowed apps*, where each window is labelled with its owning application. A maximized macOS app on its own Space appears in the windowed-apps group, so you can record it without having to swipe over there first. Then set the FPS, output directory, region, and optionally enable microphone recording and on-device transcription.
+2. **Recording**: click *Start Recording*; the GUI captures at the configured FPS into a timestamped sub-directory of the output base. A visible microphone state remains on while audio is being recorded. Press *Stop Recording* when done.
+3. **Transcribing**: when requested, microphone capture is finalized and the GUI shows a separate transcription state before review.
+4. **Review**: every captured frame appears as a thumbnail in a grid. The review also identifies the audio artifact and displays a completed transcript. Click frames to toggle selection, or use *Select All* / *Clear*.
+5. **Save**: click *Save Selected & Copy Path*. The selected frames, complete audio, transcript files, and a rewritten manifest are copied to a new `selected-YYYYMMDD-HHMMSS/` sub-directory. The absolute path is written to the clipboard.
 
 The GUI shares the same `captureSource` / `captureSourceRegion` primitives as the CLI; flags like `--display`, `--fps`, and `--output` are honoured as initial values and can be edited live in the setup screen. Pass `--devtools` if you need to open the webview developer panel.
 
@@ -133,27 +140,61 @@ Use the metadata to slice the sheet back into frames programmatically. Frames ar
 Every capture run writes `manifest.json` in the output directory. It records the
 source, fps, requested and captured frame counts, crop region, `--max-dim`,
 format/quality, output dimensions, byte sizes, elapsed time, and generated
-file paths. With `--json`, stdout is a compact run summary that includes
-`manifest_path`; read the manifest only when you need the full file list.
+file paths. Manifest version 2 adds per-frame capture offsets and, for narrated
+captures, offsets into the audio timeline plus `audio` and `transcript` artifact
+objects. This preserves synchronization even when an off-Space window skips
+frames. With `--json`, stdout is a compact run summary that includes
+`manifest_path`; read the manifest only when you need the full file list or
+timed transcript associations.
+
+### Microphone audio and transcript
+
+An audio-enabled capture adds these sidecars without creating a video:
+
+```text
+out/
+  frame_0000.png
+  frame_0001.png
+  audio.wav
+  transcript.txt
+  transcript.json
+  manifest.json
+```
+
+`audio.wav` is 16-bit PCM from the default microphone. `transcript.txt` is the
+readable text; `transcript.json` contains ordered segments with start/end times,
+text, and confidence when macOS supplies it. Transcription uses Apple's on-device
+Speech recognizer and never falls back to a cloud service. If on-device recognition
+is unavailable for the locale, the screen frames and audio remain usable and the
+manifest records the transcript as unavailable.
 
 ## macOS permissions
 
 The first time you run `screengrab`, macOS will prompt for Screen Recording permission under **System Settings → Privacy & Security → Screen Recording**. Grant it to your terminal app (Terminal, iTerm2, Ghostty, etc.). If permission is denied, captures still succeed mechanically but produce solid-black frames.
 
+`--microphone` additionally requests **Microphone** access. `--transcript` requests
+**Speech Recognition** access and requires an on-device recognizer for the chosen
+locale. These permissions are requested only when their flags or GUI controls are
+enabled. If microphone or speech permission is denied, capture fails before the
+first frame so it cannot be mistaken for a complete narrated recording. Packaged
+`.app` builds include the corresponding usage descriptions in `Info.plist` and
+are ad-hoc signed for local testing. Distribution builds still require a
+Developer ID signature and notarization.
+
 ### macOS Spaces and "windowed apps"
 
 A maximized macOS application lives on its own Space — you swipe between Spaces using the trackpad or `Ctrl-←` / `Ctrl-→`. `screengrab --list-sources` lists every such app window, and the GUI shows them under a *Windowed apps* group. Each entry is tagged `[live]` when its content is currently on the active Space, or `[off-Space]` when it is on a different Space.
 
-You can pick an `[off-Space]` window as your recording target. However, no public macOS API (including Apple's own `screencapture -l`) can grab pixels from a Space that is not currently being rendered — the compositor simply has no frame to give. In practice this means:
+You can pick an `[off-Space]` window as your recording target. ScreenCaptureKit may have a capture-ready frame for it, but that is not guaranteed; when it does not, `SCScreenshotManager` reports a generic audio/video capture failure until the compositor makes the window available again. In practice this means:
 
 - Region picker preview is only available for `[live]` sources.
-- Recording an off-Space window starts a capture loop that emits a `frame_skipped` event for every interval where the target is still off-Space. The moment you swipe to that Space, capture resumes seamlessly and frames begin landing on disk.
+- Recording an off-Space window waits instead of exiting. The CLI prints one `waiting for window:…` message; the GUI emits `capture:frame_error` events for its status UI. The moment you swipe to that Space, capture resumes and frames begin landing on disk.
 
-The recommended flow for a fullscreen app is therefore: pick the app in the source dropdown, click *Use full source*, *Start recording*, then swipe to the target Space and interact with the app. When you stop, the *Review* grid shows only the frames that landed while the Space was visible.
+The recommended flow for a fullscreen app is therefore: select its `window:0xID` source in the CLI (or pick it in the GUI), start recording, then swipe to the target Space and interact with the app. When you stop, output contains only the frames that landed while the Space was visible.
 
 ## Cross-platform
 
-The capture backend is [`kbinani/screenshot`](https://github.com/kbinani/screenshot), which has builds for macOS, Linux (X11), and Windows. The desktop GUI uses Wails v3, whose webview is WebKit on macOS, WebView2 on Windows, and WebKitGTK on Linux. macOS arm64 is the verified target; the other platforms compile from the same source but are untested here.
+The capture backend is [`kbinani/screenshot`](https://github.com/kbinani/screenshot), which has implementations for macOS, Linux (X11), and Windows. The desktop GUI uses Wails v3, whose webview is WebKit on macOS, WebView2 on Windows, and WebKitGTK on Linux. macOS arm64 is the only verified target; full builds on the other platforms are unverified. Microphone recording and transcription are currently macOS-only; their non-macOS stubs return an explicit unsupported error instead of silently producing screen-only output.
 
 Wails v3 is currently in **alpha** (this build uses `v3.0.0-alpha.91`). The native Liquid Glass APIs (`MacBackdropLiquidGlass`, `LiquidGlassStyle*`, `NSVisualEffectMaterial*`) are macOS-only; non-Mac platforms render a transparent webview that falls back to the CSS recipe.
 
@@ -170,6 +211,12 @@ screengrab/
   source.go           # unified Source abstraction (display:N | window:0xID), parseSource, listSources, captureSource
   mac_capture.go      # darwin-only CGo bindings to ScreenCaptureKit for window enumeration and capture
   mac_capture_stub.go # !darwin stub: returns ErrWindowCaptureUnsupported
+  audio.go            # microphone lifecycle and audio artifact metadata
+  mac_audio.go        # darwin AVFoundation microphone recorder
+  mac_audio_stub.go   # explicit unsupported behavior on other platforms
+  transcript.go       # transcript schema and durable artifact writers
+  mac_transcript.go   # darwin on-device Speech framework bridge
+  mac_transcript_stub.go # explicit unsupported behavior on other platforms
   gui.go              # Wails v3 desktop entry: MacLiquidGlass window + captureService bindings
   gui_test.go         # tests for the copyFrames helper used by the GUI's save flow
   source_test.go      # parseSource + Source ID round-trip tests

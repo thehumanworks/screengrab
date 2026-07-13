@@ -58,12 +58,12 @@ func runGUI(cfg config) error {
 	svc.app = app
 
 	win := app.Window.NewWithOptions(application.WebviewWindowOptions{
-		Title:            "screengrab",
-		URL:              "/",
-		Width:            1100,
-		Height:           760,
-		MinWidth:         860,
-		MinHeight:        620,
+		Title:                 "screengrab",
+		URL:                   "/",
+		Width:                 1100,
+		Height:                760,
+		MinWidth:              860,
+		MinHeight:             620,
 		Frameless:             true,
 		BackgroundType:        application.BackgroundTypeTransparent,
 		DevToolsEnabled:       cfg.devtools,
@@ -99,12 +99,17 @@ type CaptureService struct {
 
 	cfg config
 
-	mu          sync.Mutex
-	captureDir  string
-	framePaths  []string
-	stopFlag    atomic.Bool
-	recording   atomic.Bool
-	recordStart time.Time
+	mu               sync.Mutex
+	captureDir       string
+	framePaths       []string
+	frameFiles       []outputFile
+	lastManifest     *captureManifest
+	lastError        string
+	stopFlag         atomic.Bool
+	recording        atomic.Bool
+	transcribing     atomic.Bool
+	microphoneActive atomic.Bool
+	recordStart      time.Time
 }
 
 func newCaptureService(cfg config) *CaptureService {
@@ -167,22 +172,31 @@ func (s *CaptureService) SnapshotSource(sourceID string) (string, error) {
 type RecordRequest struct {
 	// SourceID is the canonical Source identifier ("display:N" or
 	// "window:0xID"). When empty, Display is used for back-compat.
-	SourceID string  `json:"source_id"`
-	Display  int     `json:"display"`
-	FPS      float64 `json:"fps"`
-	X        int     `json:"x"`
-	Y        int     `json:"y"`
-	Width    int     `json:"width"`
-	Height   int     `json:"height"`
-	Output   string  `json:"output"`
+	SourceID         string  `json:"source_id"`
+	Display          int     `json:"display"`
+	FPS              float64 `json:"fps"`
+	X                int     `json:"x"`
+	Y                int     `json:"y"`
+	Width            int     `json:"width"`
+	Height           int     `json:"height"`
+	Output           string  `json:"output"`
+	Microphone       bool    `json:"microphone"`
+	Transcript       bool    `json:"transcript"`
+	TranscriptLocale string  `json:"transcript_locale"`
 }
 
 type RecordingState struct {
-	Recording   bool    `json:"recording"`
-	Elapsed     float64 `json:"elapsed"`
-	FrameCount  int     `json:"frame_count"`
-	CaptureDir  string  `json:"capture_dir"`
-	FramePaths  []string `json:"frame_paths"`
+	Recording        bool     `json:"recording"`
+	Elapsed          float64  `json:"elapsed"`
+	FrameCount       int      `json:"frame_count"`
+	CaptureDir       string   `json:"capture_dir"`
+	FramePaths       []string `json:"frame_paths"`
+	Microphone       bool     `json:"microphone"`
+	Transcribing     bool     `json:"transcribing"`
+	AudioPath        string   `json:"audio_path,omitempty"`
+	TranscriptPath   string   `json:"transcript_path,omitempty"`
+	TranscriptStatus string   `json:"transcript_status,omitempty"`
+	Error            string   `json:"error,omitempty"`
 }
 
 func (s *CaptureService) StartRecording(req RecordRequest) error {
@@ -195,6 +209,21 @@ func (s *CaptureService) StartRecording(req RecordRequest) error {
 	if req.Output == "" {
 		req.Output = s.cfg.output
 	}
+	if req.Transcript && !req.Microphone {
+		return errors.New("transcription requires microphone recording")
+	}
+	resolvedLocale := req.TranscriptLocale
+	var transcriptPreflightErr error
+	if req.Transcript {
+		locale, err := prepareTranscription(req.TranscriptLocale)
+		resolvedLocale = locale
+		if err != nil {
+			if !errors.Is(err, errTranscriptionUnavailable) {
+				return err
+			}
+			transcriptPreflightErr = err
+		}
+	}
 
 	sourceID := req.SourceID
 	if sourceID == "" {
@@ -206,19 +235,38 @@ func (s *CaptureService) StartRecording(req RecordRequest) error {
 	}
 
 	dir := filepath.Join(req.Output, "capture-"+time.Now().Format("20060102-150405"))
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	dirMode := os.FileMode(0o755)
+	if req.Microphone {
+		dirMode = 0o700
+	}
+	if err := os.MkdirAll(dir, dirMode); err != nil {
 		return fmt.Errorf("create capture dir %q: %w", dir, err)
+	}
+	var mic *microphoneRecorder
+	if req.Microphone {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return fmt.Errorf("secure capture dir %q: %w", dir, err)
+		}
+		mic, err = startMicrophoneRecorder(filepath.Join(dir, "audio.wav"))
+		if err != nil {
+			return err
+		}
 	}
 
 	s.mu.Lock()
 	s.captureDir = dir
 	s.framePaths = nil
+	s.frameFiles = nil
+	s.lastManifest = nil
+	s.lastError = ""
 	s.mu.Unlock()
 	s.stopFlag.Store(false)
 	s.recording.Store(true)
+	s.transcribing.Store(false)
+	s.microphoneActive.Store(req.Microphone)
 	s.recordStart = time.Now()
 
-	go s.captureLoop(req, src)
+	go s.captureLoop(req, src, mic, resolvedLocale, transcriptPreflightErr)
 	return nil
 }
 
@@ -230,10 +278,26 @@ func (s *CaptureService) RecordingStatus() RecordingState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	state := RecordingState{
-		Recording:  s.recording.Load(),
-		CaptureDir: s.captureDir,
-		FrameCount: len(s.framePaths),
-		FramePaths: append([]string(nil), s.framePaths...),
+		Recording:    s.recording.Load(),
+		CaptureDir:   s.captureDir,
+		FrameCount:   len(s.framePaths),
+		FramePaths:   append([]string(nil), s.framePaths...),
+		Microphone:   s.microphoneActive.Load(),
+		Transcribing: s.transcribing.Load(),
+		Error:        s.lastError,
+	}
+	if s.lastManifest != nil {
+		state.Microphone = s.lastManifest.Audio != nil
+		if s.lastManifest.Audio != nil {
+			state.AudioPath = s.lastManifest.Audio.Path
+		}
+		if s.lastManifest.Transcript != nil {
+			state.TranscriptPath = s.lastManifest.Transcript.TextPath
+			if state.TranscriptPath == "" {
+				state.TranscriptPath = s.lastManifest.Transcript.JSONPath
+			}
+			state.TranscriptStatus = s.lastManifest.Transcript.Status
+		}
 	}
 	if !s.recordStart.IsZero() {
 		state.Elapsed = time.Since(s.recordStart).Seconds()
@@ -241,11 +305,15 @@ func (s *CaptureService) RecordingStatus() RecordingState {
 	return state
 }
 
-func (s *CaptureService) captureLoop(req RecordRequest, src Source) {
+func (s *CaptureService) captureLoop(req RecordRequest, src Source, mic *microphoneRecorder, transcriptLocale string, transcriptPreflightErr error) {
 	defer s.recording.Store(false)
+	defer s.microphoneActive.Store(false)
 
 	interval := time.Duration(float64(time.Second) / req.FPS)
 	idx := 0
+	start := s.recordStart
+	files := []outputFile{}
+	var captureErr error
 
 	emit := func(name string, data any) {
 		if s.app == nil {
@@ -255,6 +323,12 @@ func (s *CaptureService) captureLoop(req RecordRequest, src Source) {
 	}
 
 	doCapture := func() error {
+		captureOffset := time.Since(start).Seconds()
+		var audioOffset *float64
+		if mic != nil {
+			current := mic.CurrentTime()
+			audioOffset = &current
+		}
 		var img *image.RGBA
 		var err error
 		if req.Width > 0 && req.Height > 0 {
@@ -280,8 +354,16 @@ func (s *CaptureService) captureLoop(req RecordRequest, src Source) {
 		if err := writePNG(path, img); err != nil {
 			return err
 		}
+		file, err := describeFile(path, "frame", idx, img.Bounds().Dx(), img.Bounds().Dy())
+		if err != nil {
+			return err
+		}
+		file.CaptureOffsetSeconds = &captureOffset
+		file.AudioOffsetSeconds = audioOffset
+		files = append(files, file)
 		s.mu.Lock()
 		s.framePaths = append(s.framePaths, path)
+		s.frameFiles = append(s.frameFiles, file)
 		count := len(s.framePaths)
 		dir := s.captureDir
 		s.mu.Unlock()
@@ -297,36 +379,117 @@ func (s *CaptureService) captureLoop(req RecordRequest, src Source) {
 	}
 
 	if err := doCapture(); err != nil {
-		emit("capture:error", err.Error())
-		return
+		captureErr = err
+	} else {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for !s.stopFlag.Load() {
+			select {
+			case <-ticker.C:
+				if s.stopFlag.Load() {
+					break
+				}
+				if err := doCapture(); err != nil {
+					captureErr = err
+					s.stopFlag.Store(true)
+				}
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
 	}
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		if s.stopFlag.Load() {
-			break
+	finished := time.Now()
+	var audio *audioArtifact
+	if mic != nil {
+		artifact, err := mic.Stop()
+		audio = &artifact
+		if err == nil {
+			err = validateFrameTimeline(frameTimelineFromFiles(files), artifact.DurationSeconds)
+			if err != nil {
+				audio.Status = "failed"
+				audio.Error = err.Error()
+			}
 		}
-		select {
-		case <-ticker.C:
-			if s.stopFlag.Load() {
-				goto done
-			}
-			if err := doCapture(); err != nil {
-				emit("capture:error", err.Error())
-				return
-			}
-		case <-time.After(50 * time.Millisecond):
+		if err != nil && captureErr == nil {
+			captureErr = err
 		}
 	}
-done:
+
+	var transcript *transcriptArtifact
+	var transcriptErr error
+	if req.Transcript && audio != nil && audio.Status == "complete" {
+		s.transcribing.Store(true)
+		emit("capture:transcribing", map[string]any{"audio_path": audio.Path, "locale": transcriptLocale})
+		if transcriptPreflightErr != nil {
+			doc := transcriptDocument{Version: 1, Status: "unavailable", Locale: transcriptLocale, Segments: []transcriptSegment{}, Error: transcriptPreflightErr.Error()}
+			jsonPath := filepath.Join(s.captureDir, "transcript.json")
+			if err := writePrivateJSON(jsonPath, doc); err != nil {
+				transcriptErr = err
+			} else {
+				transcript = &transcriptArtifact{JSONPath: jsonPath, Locale: transcriptLocale, Status: "unavailable", Error: transcriptPreflightErr.Error()}
+				transcriptErr = transcriptPreflightErr
+			}
+		} else {
+			transcript, transcriptErr = transcribeAndWrite(audio.Path, s.captureDir, transcriptLocale, audio.DurationSeconds)
+		}
+		s.transcribing.Store(false)
+	}
+
+	region := (*regionSpec)(nil)
+	if req.Width > 0 && req.Height > 0 {
+		region = &regionSpec{X: req.X, Y: req.Y, Width: req.Width, Height: req.Height}
+	}
+	ok := captureErr == nil && transcriptErr == nil
+	manifest := captureManifest{
+		OK:             ok,
+		Partial:        !ok && (len(files) > 0 || audio != nil),
+		Version:        2,
+		Source:         src,
+		Mode:           "frames",
+		Output:         s.captureDir,
+		ManifestPath:   filepath.Join(s.captureDir, "manifest.json"),
+		Format:         "png",
+		FPS:            req.FPS,
+		CapturedFrames: len(files),
+		Region:         region,
+		StartedAt:      start.Format(time.RFC3339Nano),
+		FinishedAt:     finished.Format(time.RFC3339Nano),
+		ElapsedSeconds: finished.Sub(start).Seconds(),
+		Files:          files,
+		FrameTimeline:  frameTimelineFromFiles(files),
+		Audio:          audio,
+		Transcript:     transcript,
+	}
+	manifest.FirstFile, manifest.LastFile = firstLastFile(files)
+	manifest.FrameWidth, manifest.FrameHeight = firstOutputDimensions(files, nil)
+	if err := writeManifest(manifest.ManifestPath, manifest); err != nil && captureErr == nil {
+		captureErr = err
+	}
+	if audio != nil {
+		_ = os.Chmod(manifest.ManifestPath, 0o600)
+	}
+
 	s.mu.Lock()
 	final := append([]string(nil), s.framePaths...)
+	s.lastManifest = &manifest
+	if captureErr != nil {
+		s.lastError = captureErr.Error()
+	} else if transcriptErr != nil {
+		s.lastError = transcriptErr.Error()
+	}
 	s.mu.Unlock()
+	if captureErr != nil {
+		emit("capture:error", captureErr.Error())
+	}
+	if transcriptErr != nil {
+		emit("capture:transcript_error", transcriptErr.Error())
+	}
 	emit("capture:complete", map[string]any{
-		"frames":   final,
-		"count":    len(final),
-		"elapsed":  time.Since(s.recordStart).Seconds(),
+		"frames":     final,
+		"count":      len(final),
+		"elapsed":    time.Since(s.recordStart).Seconds(),
+		"audio":      audio,
+		"transcript": transcript,
 	})
 }
 
@@ -354,12 +517,32 @@ func (s *CaptureService) FramePreview(index int) (string, error) {
 	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(raw), nil
 }
 
+func (s *CaptureService) TranscriptText() (string, error) {
+	s.mu.Lock()
+	if s.lastManifest == nil || s.lastManifest.Transcript == nil || s.lastManifest.Transcript.TextPath == "" {
+		s.mu.Unlock()
+		return "", errors.New("no completed transcript")
+	}
+	path := s.lastManifest.Transcript.TextPath
+	s.mu.Unlock()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read transcript %q: %w", path, err)
+	}
+	return string(raw), nil
+}
+
 // SaveSelected copies the chosen frames into a fresh dest directory and
 // places the resolved path on the system clipboard so the user can paste it
 // into another tool. Returns the absolute destination path.
 func (s *CaptureService) SaveSelected(indices []int, outputBase string) (string, error) {
 	s.mu.Lock()
 	all := append([]string(nil), s.framePaths...)
+	var manifest *captureManifest
+	if s.lastManifest != nil {
+		copy := *s.lastManifest
+		manifest = &copy
+	}
 	s.mu.Unlock()
 
 	if len(indices) == 0 {
@@ -379,8 +562,14 @@ func (s *CaptureService) SaveSelected(indices []int, outputBase string) (string,
 	}
 
 	dest := filepath.Join(outputBase, "selected-"+time.Now().Format("20060102-150405"))
-	if err := copyFrames(srcs, dest); err != nil {
-		return "", err
+	if manifest != nil {
+		if err := copySelectedCapture(*manifest, indices, dest); err != nil {
+			return "", err
+		}
+	} else {
+		if err := copyFrames(srcs, dest); err != nil {
+			return "", err
+		}
 	}
 	abs, err := filepath.Abs(dest)
 	if err != nil {
@@ -421,12 +610,16 @@ func copyFrames(srcs []string, dest string) error {
 }
 
 func copyFile(src, dst string) error {
+	return copyFileMode(src, dst, 0o644)
+}
+
+func copyFileMode(src, dst string, mode os.FileMode) error {
 	sf, err := os.Open(src)
 	if err != nil {
 		return fmt.Errorf("open %q: %w", src, err)
 	}
 	defer sf.Close()
-	df, err := os.Create(dst)
+	df, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
 		return fmt.Errorf("create %q: %w", dst, err)
 	}
@@ -435,6 +628,93 @@ func copyFile(src, dst string) error {
 		return fmt.Errorf("copy %q -> %q: %w", src, dst, err)
 	}
 	return df.Close()
+}
+
+func copySelectedCapture(manifest captureManifest, indices []int, dest string) error {
+	private := manifest.Audio != nil || manifest.Transcript != nil
+	dirMode := os.FileMode(0o755)
+	if private {
+		dirMode = 0o700
+	}
+	if err := os.MkdirAll(dest, dirMode); err != nil {
+		return fmt.Errorf("create dest dir %q: %w", dest, err)
+	}
+	if private {
+		if err := os.Chmod(dest, 0o700); err != nil {
+			return err
+		}
+	}
+
+	selected := make([]outputFile, 0, len(indices))
+	for selectedIndex, sourceIndex := range indices {
+		if sourceIndex < 0 || sourceIndex >= len(manifest.Files) {
+			return fmt.Errorf("frame index %d out of range", sourceIndex)
+		}
+		source := manifest.Files[sourceIndex]
+		ext := filepath.Ext(source.Path)
+		path := filepath.Join(dest, fmt.Sprintf("frame_%04d%s", selectedIndex, ext))
+		if err := copyFile(source.Path, path); err != nil {
+			return err
+		}
+		source.Path = path
+		selected = append(selected, source)
+	}
+
+	manifest.Output = dest
+	manifest.ManifestPath = filepath.Join(dest, "manifest.json")
+	manifest.Files = selected
+	manifest.FrameTimeline = frameTimelineFromFiles(selected)
+	manifest.CapturedFrames = len(selected)
+	manifest.RequestedFrames = 0
+	manifest.FirstFile, manifest.LastFile = firstLastFile(selected)
+	if manifest.Audio != nil {
+		audio := *manifest.Audio
+		audio.Path = filepath.Join(dest, "audio.wav")
+		if err := copyFileMode(manifest.Audio.Path, audio.Path, 0o600); err != nil {
+			return err
+		}
+		manifest.Audio = &audio
+	}
+	if manifest.Transcript != nil {
+		transcript := *manifest.Transcript
+		if transcript.TextPath != "" {
+			newPath := filepath.Join(dest, "transcript.txt")
+			if err := copyFileMode(transcript.TextPath, newPath, 0o600); err != nil {
+				return err
+			}
+			transcript.TextPath = newPath
+		}
+		if transcript.JSONPath != "" {
+			newPath := filepath.Join(dest, "transcript.json")
+			if err := copyFileMode(transcript.JSONPath, newPath, 0o600); err != nil {
+				return err
+			}
+			transcript.JSONPath = newPath
+		}
+		manifest.Transcript = &transcript
+	}
+	if err := writeManifest(manifest.ManifestPath, manifest); err != nil {
+		return err
+	}
+	if private {
+		return os.Chmod(manifest.ManifestPath, 0o600)
+	}
+	return nil
+}
+
+func frameTimelineFromFiles(files []outputFile) []frameTiming {
+	out := make([]frameTiming, 0, len(files))
+	for _, file := range files {
+		if file.CaptureOffsetSeconds == nil {
+			continue
+		}
+		out = append(out, frameTiming{
+			Index:                file.Index,
+			CaptureOffsetSeconds: *file.CaptureOffsetSeconds,
+			AudioOffsetSeconds:   file.AudioOffsetSeconds,
+		})
+	}
+	return out
 }
 
 func encodePNGBase64(img image.Image) (string, error) {

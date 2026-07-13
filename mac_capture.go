@@ -14,8 +14,8 @@ package main
 #include <stdlib.h>
 #include <string.h>
 
-// Window enumeration and capture for macOS Spaces (incl. fullscreen apps on
-// non-active Spaces). The legacy CGWindowListCopyWindowInfo /
+// Window enumeration and capture for macOS Spaces, including discovery of
+// fullscreen apps on non-active Spaces. The legacy CGWindowListCopyWindowInfo /
 // CGWindowListCreateImage path is `unavailable` (hard error) on the macOS 15+
 // SDK we ship with, so this file routes everything through ScreenCaptureKit.
 // SCK is fundamentally async; we bridge it to a sync call site with a
@@ -178,10 +178,6 @@ static sg_capture_buf sg_capture_window(uint32_t window_id) {
     config.showsCursor = NO;
     config.capturesAudio = NO;
     if (@available(macOS 14.2, *)) {
-        // Tell SCK that we want the latest frame even if no compositor
-        // update has happened since the last sample. Without this, a
-        // fullscreen-app window on an inactive Space can return nil because
-        // the compositor has not pushed a fresh sample for it. macOS 14.2+.
         config.ignoreShadowsSingleWindow = YES;
     }
 

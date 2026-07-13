@@ -50,6 +50,22 @@
         </div>
       </div>
 
+      <div class="audio-options glass-pill">
+        <label class="check-control" for="microphoneInput">
+          <input id="microphoneInput" type="checkbox" />
+          <span>Record microphone</span>
+        </label>
+        <label class="check-control" for="transcriptInput">
+          <input id="transcriptInput" type="checkbox" />
+          <span>Create on-device transcript</span>
+        </label>
+        <label class="locale-control" for="transcriptLocaleInput">
+          <span>Locale</span>
+          <input id="transcriptLocaleInput" type="text" class="control" placeholder="System locale" disabled />
+        </label>
+      </div>
+      <p class="field-hint">Microphone and transcription are off by default. Audio stays on this Mac; transcription never falls back to a cloud service.</p>
+
       <div class="field">
         <label class="field-label">Capture region</label>
         <div class="region-summary glass-pill" id="regionSummary">Full source</div>
@@ -111,6 +127,10 @@
           <div class="rec-label">Frames</div>
           <div class="rec-value" id="recFrames">0</div>
         </div>
+		<div class="rec-stat">
+		  <div class="rec-label">Microphone</div>
+		  <div class="rec-value rec-value-small" id="recAudio">Off</div>
+		</div>
       </div>
 
       <div class="rec-pulse" aria-hidden="true">
@@ -133,6 +153,12 @@
       </div>
 
       <div class="review-grid" id="reviewGrid"></div>
+
+      <section class="review-artifacts glass-pill" id="reviewArtifacts" hidden>
+        <div><strong>Audio:</strong> <span id="reviewAudioPath">—</span></div>
+        <div><strong>Transcript:</strong> <span id="reviewTranscriptStatus">—</span></div>
+        <pre id="reviewTranscriptText" hidden></pre>
+      </section>
 
       <footer class="view-actions">
         <button class="btn btn-secondary" id="discardBtn">Discard &amp; back</button>

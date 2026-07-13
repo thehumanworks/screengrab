@@ -22,9 +22,9 @@ const (
 // canonical form the CLI and the frontend use to round-trip a selection back
 // across the bridge.
 //
-//   display:0           — physical display, index 0
-//   window:0x1A2B       — macOS window, hex CGWindowID
-//   window:1234         — macOS window, decimal CGWindowID (both forms parse)
+//	display:0           — physical display, index 0
+//	window:0x1A2B       — macOS window, hex CGWindowID
+//	window:1234         — macOS window, decimal CGWindowID (both forms parse)
 type Source struct {
 	ID     string `json:"id"`
 	Kind   string `json:"kind"`
@@ -300,9 +300,9 @@ func absInt(v int) int {
 	return v
 }
 
-// captureSource captures the full target. For a window source the result is
-// the window's current pixels regardless of which macOS Space currently has
-// focus, courtesy of SCContentFilter initWithDesktopIndependentWindow.
+// captureSource captures the full target. A window on an inactive macOS Space
+// can remain discoverable without having a compositor frame; callers that run
+// recording loops retry that transient state until the Space becomes active.
 func captureSource(src Source) (*image.RGBA, error) {
 	switch src.Kind {
 	case SourceKindDisplay:
