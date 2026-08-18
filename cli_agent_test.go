@@ -137,6 +137,51 @@ func TestNormalizeConfigFormatAndValidation(t *testing.T) {
 	}
 }
 
+func TestNormalizeConfigAudioSelection(t *testing.T) {
+	base := config{fps: 2, mode: "frames", format: "png", quality: 85, output: "."}
+
+	micAlias := base
+	micAlias.microphone = true
+	if err := normalizeConfig(&micAlias); err != nil {
+		t.Fatalf("normalizeConfig --microphone: %v", err)
+	}
+	if micAlias.audio != "mic" || !micAlias.audioMic() || micAlias.audioSystem() {
+		t.Fatalf("--microphone alias resolved to audio=%q", micAlias.audio)
+	}
+
+	merged := base
+	merged.microphone = true
+	merged.audio = "system"
+	if err := normalizeConfig(&merged); err != nil {
+		t.Fatalf("normalizeConfig --microphone --audio system: %v", err)
+	}
+	if merged.audio != "both" || !merged.audioMic() || !merged.audioSystem() {
+		t.Fatalf("--microphone + --audio system resolved to audio=%q", merged.audio)
+	}
+
+	systemOnly := base
+	systemOnly.audio = "System"
+	if err := normalizeConfig(&systemOnly); err != nil {
+		t.Fatalf("normalizeConfig --audio system: %v", err)
+	}
+	if systemOnly.audio != "system" || systemOnly.audioMic() || !systemOnly.audioSystem() || systemOnly.microphone {
+		t.Fatalf("--audio system resolved to audio=%q microphone=%v", systemOnly.audio, systemOnly.microphone)
+	}
+
+	invalid := base
+	invalid.audio = "speakers"
+	if err := normalizeConfig(&invalid); err == nil || !strings.Contains(err.Error(), "--audio") {
+		t.Fatalf("expected invalid --audio value to fail, got %v", err)
+	}
+
+	transcriptWithSystem := base
+	transcriptWithSystem.audio = "system"
+	transcriptWithSystem.transcript = true
+	if err := normalizeConfig(&transcriptWithSystem); err != nil {
+		t.Fatalf("--transcript with --audio system should validate: %v", err)
+	}
+}
+
 func TestWriteImageJPEG(t *testing.T) {
 	img := image.NewRGBA(image.Rect(0, 0, 8, 8))
 	path := filepath.Join(t.TempDir(), "frame_0000.jpg")
@@ -181,7 +226,7 @@ func TestPrepareOutputDirOverwriteGuard(t *testing.T) {
 
 func TestGeneratedFilePatternsIncludeAudioArtifacts(t *testing.T) {
 	patterns := strings.Join(generatedFilePatterns("out"), "\n")
-	for _, name := range []string{"audio.wav", "transcript.txt", "transcript.json"} {
+	for _, name := range []string{"audio.wav", "system_audio.wav", "transcript.txt", "transcript.json", "system_transcript.txt", "system_transcript.json"} {
 		if !strings.Contains(patterns, name) {
 			t.Fatalf("generated patterns do not include %s", name)
 		}
@@ -191,17 +236,26 @@ func TestGeneratedFilePatternsIncludeAudioArtifacts(t *testing.T) {
 func TestTimedArtifactValidation(t *testing.T) {
 	a := 0.02
 	b := 0.52
+	sa := 0.01
+	sb := 0.51
 	timeline := []frameTiming{
-		{Index: 0, CaptureOffsetSeconds: 0, AudioOffsetSeconds: &a},
-		{Index: 1, CaptureOffsetSeconds: 0.5, AudioOffsetSeconds: &b},
+		{Index: 0, CaptureOffsetSeconds: 0, AudioOffsetSeconds: &a, SystemAudioOffsetSeconds: &sa},
+		{Index: 1, CaptureOffsetSeconds: 0.5, AudioOffsetSeconds: &b, SystemAudioOffsetSeconds: &sb},
 	}
-	if err := validateFrameTimeline(timeline, 1); err != nil {
+	if err := validateFrameTimeline(timeline, 1, "audio", micOffset); err != nil {
 		t.Fatalf("valid frame timeline: %v", err)
+	}
+	if err := validateFrameTimeline(timeline, 1, "system audio", systemOffset); err != nil {
+		t.Fatalf("valid system audio timeline: %v", err)
 	}
 	bad := -0.1
 	timeline[1].AudioOffsetSeconds = &bad
-	if err := validateFrameTimeline(timeline, 1); err == nil {
+	if err := validateFrameTimeline(timeline, 1, "audio", micOffset); err == nil {
 		t.Fatal("expected unordered/negative frame timeline to fail")
+	}
+	timeline[1].SystemAudioOffsetSeconds = nil
+	if err := validateFrameTimeline(timeline, 1, "system audio", systemOffset); err == nil {
+		t.Fatal("expected missing system audio offset to fail")
 	}
 
 	doc := transcriptDocument{Segments: []transcriptSegment{

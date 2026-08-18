@@ -51,6 +51,10 @@ The resulting `./screengrab` is a self-contained binary. On macOS arm64 it is ar
 
 # Record microphone narration and create a timed, on-device transcript
 ./screengrab --duration 10s --microphone --transcript --output narrated-capture
+
+# Record what the captured source is playing (system audio) alongside frames,
+# plus your narration, with a transcript for each track
+./screengrab --duration 10s --audio both --transcript --output demo-capture
 ```
 
 ## Flags
@@ -72,8 +76,9 @@ The resulting `./screengrab` is a self-contained binary. On macOS arm64 it is ar
 | `--cols` | `0` (auto) | Columns in spritesheet grid; defaults to `ceil(sqrt(frame_count))`. |
 | `--json` | `false` | Emit machine-readable JSON for `--list-sources` and final capture summaries. Capture summaries point to `manifest.json` for the full file list. |
 | `--overwrite` | `false` | Allow replacing generated files already present in the output directory. Without this, existing `frame_*`, `spritesheet.*`, or `manifest.json` files cause a fail-fast error. |
-| `--microphone` | `false` | Record the current default microphone as 16-bit PCM `audio.wav` on macOS. Audio recording is opt-in. |
-| `--transcript` | `false` | Create `transcript.txt` and timed `transcript.json` from the recorded microphone using on-device recognition. Requires `--microphone`. |
+| `--audio` | (unset) | Audio tracks to record on macOS: `mic` (default microphone → `audio.wav`), `system` (what the captured display or window is playing → `system_audio.wav`), or `both`. Audio recording is opt-in. |
+| `--microphone` | `false` | Shorthand for `--audio mic`; kept for back-compat. Combining it with `--audio system` records both tracks. |
+| `--transcript` | `false` | Create timed transcripts (`transcript.*` for the microphone, `system_transcript.*` for system audio) using on-device recognition. Requires `--audio` or `--microphone`. |
 | `--transcript-locale` | system locale | Recognition locale such as `en-GB` or `en-US`. Requires `--transcript`. |
 | `--gui` | `false` | Launch the cross-platform desktop GUI instead of the headless CLI flow. |
 | `--devtools` | `false` | Open the webview developer tools panel when `--gui` is set. |
@@ -140,39 +145,55 @@ Use the metadata to slice the sheet back into frames programmatically. Frames ar
 Every capture run writes `manifest.json` in the output directory. It records the
 source, fps, requested and captured frame counts, crop region, `--max-dim`,
 format/quality, output dimensions, byte sizes, elapsed time, and generated
-file paths. Manifest version 2 adds per-frame capture offsets and, for narrated
-captures, offsets into the audio timeline plus `audio` and `transcript` artifact
-objects. This preserves synchronization even when an off-Space window skips
-frames. With `--json`, stdout is a compact run summary that includes
+file paths. Manifest version 2 adds per-frame capture offsets and, for
+audio-enabled captures, offsets into each audio timeline
+(`audio_offset_seconds` for the microphone, `system_audio_offset_seconds` for
+system audio) plus `audio` / `system_audio` and `transcript` /
+`system_transcript` artifact objects. This preserves synchronization even when
+an off-Space window skips frames. With `--json`, stdout is a compact run summary that includes
 `manifest_path`; read the manifest only when you need the full file list or
 timed transcript associations.
 
-### Microphone audio and transcript
+### Audio tracks and transcripts
 
-An audio-enabled capture adds these sidecars without creating a video:
+An audio-enabled capture (`--audio both --transcript` here) adds these sidecars
+without creating a video:
 
 ```text
 out/
   frame_0000.png
   frame_0001.png
-  audio.wav
+  audio.wav               # microphone (mic / both)
+  system_audio.wav        # system audio (system / both)
   transcript.txt
   transcript.json
+  system_transcript.txt
+  system_transcript.json
   manifest.json
 ```
 
-`audio.wav` is 16-bit PCM from the default microphone. `transcript.txt` is the
-readable text; `transcript.json` contains ordered segments with start/end times,
-text, and confidence when macOS supplies it. Transcription uses Apple's on-device
-Speech recognizer and never falls back to a cloud service. If on-device recognition
-is unavailable for the locale, the screen frames and audio remain usable and the
-manifest records the transcript as unavailable.
+`audio.wav` is 16-bit PCM from the default microphone; `system_audio.wav` is
+16-bit PCM of whatever the captured source is playing, recorded via
+ScreenCaptureKit's audio stream. When the source is a window, system audio is
+scoped to the owning app; when it is a display, the full system mix is
+recorded. The two tracks stay separate on purpose — "what the user said" and
+"what the machine played" are distinct signals for a consuming AI agent, and
+each gets its own timed transcript.
+
+`transcript.txt` is the readable text; `transcript.json` contains ordered
+segments with start/end times, text, and confidence when macOS supplies it
+(same shape for `system_transcript.*`). Transcription uses Apple's on-device
+Speech recognizer and never falls back to a cloud service. If on-device
+recognition is unavailable for the locale, the screen frames and audio remain
+usable and the manifest records the transcript as unavailable.
 
 ## macOS permissions
 
 The first time you run `screengrab`, macOS will prompt for Screen Recording permission under **System Settings → Privacy & Security → Screen Recording**. Grant it to your terminal app (Terminal, iTerm2, Ghostty, etc.). If permission is denied, captures still succeed mechanically but produce solid-black frames.
 
-`--microphone` additionally requests **Microphone** access. `--transcript` requests
+`--audio system` needs no extra permission — ScreenCaptureKit's audio stream is
+covered by the same Screen Recording grant as the frames.
+`--microphone` (or `--audio mic`) additionally requests **Microphone** access. `--transcript` requests
 **Speech Recognition** access and requires an on-device recognizer for the chosen
 locale. These permissions are requested only when their flags or GUI controls are
 enabled. If microphone or speech permission is denied, capture fails before the
@@ -194,7 +215,7 @@ The recommended flow for a fullscreen app is therefore: select its `window:0xID`
 
 ## Cross-platform
 
-The capture backend is [`kbinani/screenshot`](https://github.com/kbinani/screenshot), which has implementations for macOS, Linux (X11), and Windows. The desktop GUI uses Wails v3, whose webview is WebKit on macOS, WebView2 on Windows, and WebKitGTK on Linux. macOS arm64 is the only verified target; full builds on the other platforms are unverified. Microphone recording and transcription are currently macOS-only; their non-macOS stubs return an explicit unsupported error instead of silently producing screen-only output.
+The capture backend is [`kbinani/screenshot`](https://github.com/kbinani/screenshot), which has implementations for macOS, Linux (X11), and Windows. The desktop GUI uses Wails v3, whose webview is WebKit on macOS, WebView2 on Windows, and WebKitGTK on Linux. macOS arm64 is the only verified target; full builds on the other platforms are unverified. Microphone recording, system-audio recording, and transcription are currently macOS-only; their non-macOS stubs return an explicit unsupported error instead of silently producing screen-only output.
 
 Wails v3 is currently in **alpha** (this build uses `v3.0.0-alpha.91`). The native Liquid Glass APIs (`MacBackdropLiquidGlass`, `LiquidGlassStyle*`, `NSVisualEffectMaterial*`) are macOS-only; non-Mac platforms render a transparent webview that falls back to the CSS recipe.
 
@@ -211,9 +232,11 @@ screengrab/
   source.go           # unified Source abstraction (display:N | window:0xID), parseSource, listSources, captureSource
   mac_capture.go      # darwin-only CGo bindings to ScreenCaptureKit for window enumeration and capture
   mac_capture_stub.go # !darwin stub: returns ErrWindowCaptureUnsupported
-  audio.go            # microphone lifecycle and audio artifact metadata
+  audio.go            # audio recorder lifecycle (mic + system) and artifact metadata
   mac_audio.go        # darwin AVFoundation microphone recorder
   mac_audio_stub.go   # explicit unsupported behavior on other platforms
+  mac_system_audio.go # darwin ScreenCaptureKit system-audio recorder
+  mac_system_audio_stub.go # explicit unsupported behavior on other platforms
   transcript.go       # transcript schema and durable artifact writers
   mac_transcript.go   # darwin on-device Speech framework bridge
   mac_transcript_stub.go # explicit unsupported behavior on other platforms

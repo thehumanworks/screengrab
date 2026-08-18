@@ -38,7 +38,7 @@ func prepareTranscription(locale string) (string, error) {
 	return preparePlatformTranscription(locale)
 }
 
-func transcribeAndWrite(audioPath, outputDir, locale string, audioDuration float64) (*transcriptArtifact, error) {
+func transcribeAndWrite(audioPath, outputDir, baseName, locale string, audioDuration float64) (*transcriptArtifact, error) {
 	doc, err := transcribePlatformAudio(audioPath, locale)
 	if err == nil {
 		err = validateTranscriptDocument(doc, audioDuration)
@@ -60,7 +60,7 @@ func transcribeAndWrite(audioPath, outputDir, locale string, audioDuration float
 		doc.Segments = []transcriptSegment{}
 	}
 
-	jsonPath := filepath.Join(outputDir, "transcript.json")
+	jsonPath := filepath.Join(outputDir, baseName+".json")
 	if writeErr := writePrivateJSON(jsonPath, doc); writeErr != nil {
 		return nil, writeErr
 	}
@@ -71,7 +71,7 @@ func transcribeAndWrite(audioPath, outputDir, locale string, audioDuration float
 		Error:    doc.Error,
 	}
 	if doc.Status == "complete" {
-		textPath := filepath.Join(outputDir, "transcript.txt")
+		textPath := filepath.Join(outputDir, baseName+".txt")
 		if writeErr := os.WriteFile(textPath, []byte(doc.Text+"\n"), 0o600); writeErr != nil {
 			return nil, fmt.Errorf("write transcript text: %w", writeErr)
 		}
@@ -80,18 +80,48 @@ func transcribeAndWrite(audioPath, outputDir, locale string, audioDuration float
 	return artifact, err
 }
 
-func validateFrameTimeline(timeline []frameTiming, audioDuration float64) error {
+// produceTranscript transcribes one completed audio track into
+// <baseName>.json/.txt. A track that failed to record is skipped so its
+// audio error stays the primary signal; a preflight-unavailable recognizer
+// still writes a durable "unavailable" document next to the audio.
+func produceTranscript(outputDir, baseName string, audio *audioArtifact, locale string, preflightErr error) (*transcriptArtifact, error) {
+	if audio == nil || audio.Status != "complete" {
+		return nil, nil
+	}
+	if preflightErr != nil {
+		doc := transcriptDocument{
+			Version:  1,
+			Status:   "unavailable",
+			Locale:   locale,
+			Segments: []transcriptSegment{},
+			Error:    preflightErr.Error(),
+		}
+		jsonPath := filepath.Join(outputDir, baseName+".json")
+		if err := writePrivateJSON(jsonPath, doc); err != nil {
+			return nil, err
+		}
+		return &transcriptArtifact{JSONPath: jsonPath, Locale: locale, Status: "unavailable", Error: preflightErr.Error()}, preflightErr
+	}
+	return transcribeAndWrite(audio.Path, outputDir, baseName, locale, audio.DurationSeconds)
+}
+
+func micOffset(f frameTiming) *float64 { return f.AudioOffsetSeconds }
+
+func systemOffset(f frameTiming) *float64 { return f.SystemAudioOffsetSeconds }
+
+func validateFrameTimeline(timeline []frameTiming, audioDuration float64, label string, offsetOf func(frameTiming) *float64) error {
 	previous := -1.0
 	for _, frame := range timeline {
-		if frame.AudioOffsetSeconds == nil {
-			return fmt.Errorf("frame %d has no audio offset", frame.Index)
+		offsetPtr := offsetOf(frame)
+		if offsetPtr == nil {
+			return fmt.Errorf("frame %d has no %s offset", frame.Index, label)
 		}
-		offset := *frame.AudioOffsetSeconds
+		offset := *offsetPtr
 		if offset < previous {
-			return fmt.Errorf("frame %d audio offset %.6f precedes the prior offset %.6f", frame.Index, offset, previous)
+			return fmt.Errorf("frame %d %s offset %.6f precedes the prior offset %.6f", frame.Index, label, offset, previous)
 		}
 		if offset < 0 || offset > audioDuration+0.5 {
-			return fmt.Errorf("frame %d audio offset %.6f is outside audio duration %.6f", frame.Index, offset, audioDuration)
+			return fmt.Errorf("frame %d %s offset %.6f is outside audio duration %.6f", frame.Index, label, offset, audioDuration)
 		}
 		previous = offset
 	}

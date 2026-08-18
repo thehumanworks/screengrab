@@ -15,6 +15,7 @@ const state = {
   framePaths: [],
   selected: new Set(),
   microphone: false,
+  systemAudio: false,
   transcript: false,
   transcriptLocale: "",
   recordingStatus: null,
@@ -106,6 +107,7 @@ async function initSetup() {
   $("fpsInput").value = state.fps;
   $("outputInput").value = state.output;
 	$("microphoneInput").checked = state.microphone;
+	$("systemAudioInput").checked = state.systemAudio;
 	$("transcriptInput").checked = state.transcript;
 	$("transcriptLocaleInput").value = state.transcriptLocale;
 	$("transcriptLocaleInput").disabled = !state.transcript;
@@ -164,6 +166,7 @@ function commitSetupForm() {
   const out = $("outputInput").value.trim();
   if (out) state.output = out;
 	state.microphone = $("microphoneInput").checked;
+	state.systemAudio = $("systemAudioInput").checked;
 	state.transcript = $("transcriptInput").checked;
 	state.transcriptLocale = $("transcriptLocaleInput").value.trim();
 }
@@ -305,6 +308,13 @@ async function runCountdown(src, seconds = 3) {
   return true;
 }
 
+function audioLabel(mic, system) {
+  if (mic && system) return "Mic + System";
+  if (mic) return "Mic";
+  if (system) return "System";
+  return "Off";
+}
+
 function escapeHTML(s) {
   return String(s)
     .replace(/&/g, "&amp;")
@@ -335,7 +345,7 @@ async function startRecording() {
   setSubtitle("recording");
   $("recElapsed").textContent = "0.0s";
   $("recFrames").textContent = "0";
-	$("recAudio").textContent = state.microphone ? "On" : "Off";
+	$("recAudio").textContent = audioLabel(state.microphone, state.systemAudio);
 	$("recordingSub").textContent = "Press Stop when you are done; partial output is preserved.";
 
   try {
@@ -348,6 +358,7 @@ async function startRecording() {
       height: state.region.height,
       output: state.output,
 	  microphone: state.microphone,
+	  system_audio: state.systemAudio,
 	  transcript: state.transcript,
 	  transcript_locale: state.transcriptLocale,
     });
@@ -364,10 +375,10 @@ async function startRecording() {
       $("recFrames").textContent = String(s.frame_count);
       state.framePaths = s.frame_paths || [];
 	  state.recordingStatus = s;
-	  $("recAudio").textContent = s.microphone ? "On" : "Off";
+	  $("recAudio").textContent = audioLabel(s.microphone, s.system_audio);
 	  if (s.transcribing) {
 		setSubtitle("transcribing");
-		$("recordingSub").textContent = "Screen and microphone capture are complete. Creating the on-device transcript…";
+		$("recordingSub").textContent = "Screen and audio capture are complete. Creating the on-device transcript…";
 	  }
       if (!s.recording) {
         clearInterval(recordingTimerHandle);
@@ -394,9 +405,10 @@ async function showReview() {
 
 	const artifacts = $("reviewArtifacts");
 	const status = state.recordingStatus;
-	if (status && (status.audio_path || status.transcript_status)) {
+	if (status && (status.audio_path || status.system_audio_path || status.transcript_status)) {
 	  artifacts.hidden = false;
 	  $("reviewAudioPath").textContent = status.audio_path || "not available";
+	  $("reviewSystemAudioPath").textContent = status.system_audio_path || "not available";
 	  $("reviewTranscriptStatus").textContent = status.transcript_status || "not requested";
 	  const text = $("reviewTranscriptText");
 	  text.hidden = true;
@@ -455,7 +467,8 @@ async function saveSelected() {
   const indices = Array.from(state.selected).sort((a, b) => a - b);
   try {
     const dest = await svc("SaveSelected", indices, state.output);
-    const associated = state.recordingStatus?.audio_path ? " with associated audio and transcript artifacts" : "";
+    const associated = (state.recordingStatus?.audio_path || state.recordingStatus?.system_audio_path)
+      ? " with associated audio and transcript artifacts" : "";
     toast(`Saved ${indices.length} frames${associated} to ${dest} — path copied.`);
   } catch (e) {
     toast(`Save failed: ${e?.message ?? e}`);
@@ -483,14 +496,18 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
   $("startBtn").addEventListener("click", startRecording);
 
-	$("microphoneInput").addEventListener("change", () => {
-	  if (!$("microphoneInput").checked) {
+	const syncAudioControls = () => {
+	  const anyAudio = $("microphoneInput").checked || $("systemAudioInput").checked;
+	  if (!anyAudio) {
 		$("transcriptInput").checked = false;
-		$("transcriptLocaleInput").disabled = true;
 	  }
-	});
+	  $("transcriptLocaleInput").disabled = !$("transcriptInput").checked;
+	};
+	$("microphoneInput").addEventListener("change", syncAudioControls);
+	$("systemAudioInput").addEventListener("change", syncAudioControls);
 	$("transcriptInput").addEventListener("change", () => {
-	  if ($("transcriptInput").checked) $("microphoneInput").checked = true;
+	  const anyAudio = $("microphoneInput").checked || $("systemAudioInput").checked;
+	  if ($("transcriptInput").checked && !anyAudio) $("microphoneInput").checked = true;
 	  $("transcriptLocaleInput").disabled = !$("transcriptInput").checked;
 	});
 

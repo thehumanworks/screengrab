@@ -55,6 +55,10 @@
           <input id="microphoneInput" type="checkbox" />
           <span>Record microphone</span>
         </label>
+        <label class="check-control" for="systemAudioInput">
+          <input id="systemAudioInput" type="checkbox" />
+          <span>Record system audio</span>
+        </label>
         <label class="check-control" for="transcriptInput">
           <input id="transcriptInput" type="checkbox" />
           <span>Create on-device transcript</span>
@@ -64,7 +68,7 @@
           <input id="transcriptLocaleInput" type="text" class="control" placeholder="System locale" disabled />
         </label>
       </div>
-      <p class="field-hint">Microphone and transcription are off by default. Audio stays on this Mac; transcription never falls back to a cloud service.</p>
+      <p class="field-hint">Audio capture is off by default. Microphone records your narration; system audio records what the captured source is playing. Audio stays on this Mac; transcription never falls back to a cloud service.</p>
 
       <div class="field">
         <label class="field-label">Capture region</label>
@@ -128,7 +132,7 @@
           <div class="rec-value" id="recFrames">0</div>
         </div>
 		<div class="rec-stat">
-		  <div class="rec-label">Microphone</div>
+		  <div class="rec-label">Audio</div>
 		  <div class="rec-value rec-value-small" id="recAudio">Off</div>
 		</div>
       </div>
@@ -156,6 +160,7 @@
 
       <section class="review-artifacts glass-pill" id="reviewArtifacts" hidden>
         <div><strong>Audio:</strong> <span id="reviewAudioPath">—</span></div>
+        <div><strong>System audio:</strong> <span id="reviewSystemAudioPath">—</span></div>
         <div><strong>Transcript:</strong> <span id="reviewTranscriptStatus">—</span></div>
         <pre id="reviewTranscriptText" hidden></pre>
       </section>

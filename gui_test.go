@@ -112,43 +112,51 @@ func TestCopySelectedCapturePreservesAssociatedArtifacts(t *testing.T) {
 		writeTinyPNG(t, path, color.RGBA{R: uint8(30 * i), G: 20, B: 40, A: 255})
 		captureOffset := float64(i) * 0.5
 		audioOffset := captureOffset + 0.03
+		systemAudioOffset := captureOffset + 0.01
 		frames = append(frames, outputFile{
-			Path:                 path,
-			Type:                 "frame",
-			Index:                i,
-			CaptureOffsetSeconds: &captureOffset,
-			AudioOffsetSeconds:   &audioOffset,
+			Path:                     path,
+			Type:                     "frame",
+			Index:                    i,
+			CaptureOffsetSeconds:     &captureOffset,
+			AudioOffsetSeconds:       &audioOffset,
+			SystemAudioOffsetSeconds: &systemAudioOffset,
 		})
 	}
 	audioPath := filepath.Join(src, "audio.wav")
+	systemAudioPath := filepath.Join(src, "system_audio.wav")
 	textPath := filepath.Join(src, "transcript.txt")
 	jsonPath := filepath.Join(src, "transcript.json")
-	if err := os.WriteFile(audioPath, []byte("audio"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(textPath, []byte("hello world\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(jsonPath, []byte(`{"version":1,"status":"complete"}`), 0o600); err != nil {
-		t.Fatal(err)
+	systemJSONPath := filepath.Join(src, "system_transcript.json")
+	for path, contents := range map[string]string{
+		audioPath:       "audio",
+		systemAudioPath: "system audio",
+		textPath:        "hello world\n",
+		jsonPath:        `{"version":1,"status":"complete"}`,
+		systemJSONPath:  `{"version":1,"status":"complete"}`,
+	} {
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	manifest := captureManifest{
-		OK:             true,
-		Version:        2,
-		Output:         src,
-		ManifestPath:   filepath.Join(src, "manifest.json"),
-		CapturedFrames: len(frames),
-		Files:          frames,
-		FrameTimeline:  frameTimelineFromFiles(frames),
-		Audio:          &audioArtifact{Path: audioPath, Format: "wav", Codec: "pcm-s16le", Status: "complete", DurationSeconds: 2},
-		Transcript:     &transcriptArtifact{TextPath: textPath, JSONPath: jsonPath, Locale: "en-GB", Status: "complete"},
+		OK:               true,
+		Version:          2,
+		Output:           src,
+		ManifestPath:     filepath.Join(src, "manifest.json"),
+		CapturedFrames:   len(frames),
+		Files:            frames,
+		FrameTimeline:    frameTimelineFromFiles(frames),
+		Audio:            &audioArtifact{Path: audioPath, Format: "wav", Codec: "pcm-s16le", Status: "complete", DurationSeconds: 2},
+		SystemAudio:      &audioArtifact{Path: systemAudioPath, Format: "wav", Codec: "pcm-s16le", Status: "complete", DurationSeconds: 2},
+		Transcript:       &transcriptArtifact{TextPath: textPath, JSONPath: jsonPath, Locale: "en-GB", Status: "complete"},
+		SystemTranscript: &transcriptArtifact{JSONPath: systemJSONPath, Locale: "en-GB", Status: "complete"},
 	}
 
 	dest := filepath.Join(t.TempDir(), "selected")
 	if err := copySelectedCapture(manifest, []int{0, 2}, dest); err != nil {
 		t.Fatalf("copySelectedCapture: %v", err)
 	}
-	for _, name := range []string{"frame_0000.png", "frame_0001.png", "audio.wav", "transcript.txt", "transcript.json", "manifest.json"} {
+	for _, name := range []string{"frame_0000.png", "frame_0001.png", "audio.wav", "system_audio.wav", "transcript.txt", "transcript.json", "system_transcript.json", "manifest.json"} {
 		if _, err := os.Stat(filepath.Join(dest, name)); err != nil {
 			t.Fatalf("missing %s: %v", name, err)
 		}
@@ -174,11 +182,20 @@ func TestCopySelectedCapturePreservesAssociatedArtifacts(t *testing.T) {
 	if got.Files[1].AudioOffsetSeconds == nil || *got.Files[1].AudioOffsetSeconds != 1.03 {
 		t.Fatalf("selected audio offset was not preserved: %+v", got.Files[1].AudioOffsetSeconds)
 	}
+	if got.Files[1].SystemAudioOffsetSeconds == nil || *got.Files[1].SystemAudioOffsetSeconds != 1.01 {
+		t.Fatalf("selected system audio offset was not preserved: %+v", got.Files[1].SystemAudioOffsetSeconds)
+	}
 	if got.Audio == nil || got.Audio.Path != filepath.Join(dest, "audio.wav") {
 		t.Fatalf("selected audio association = %+v", got.Audio)
 	}
+	if got.SystemAudio == nil || got.SystemAudio.Path != filepath.Join(dest, "system_audio.wav") {
+		t.Fatalf("selected system audio association = %+v", got.SystemAudio)
+	}
 	if got.Transcript == nil || got.Transcript.TextPath != filepath.Join(dest, "transcript.txt") {
 		t.Fatalf("selected transcript association = %+v", got.Transcript)
+	}
+	if got.SystemTranscript == nil || got.SystemTranscript.JSONPath != filepath.Join(dest, "system_transcript.json") {
+		t.Fatalf("selected system transcript association = %+v", got.SystemTranscript)
 	}
 	info, err := os.Stat(dest)
 	if err != nil {
