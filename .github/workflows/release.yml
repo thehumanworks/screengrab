@@ -56,8 +56,17 @@ jobs:
               });
               core.info(`created ${tag} at ${context.sha}`);
             } catch (e) {
-              if (e.status === 422) core.info(`${tag} already exists, reusing it`);
-              else throw e;
+              if (e.status !== 422) throw e;
+              // Tag exists (e.g. from a failed earlier dispatch): move it to
+              // the dispatched commit so the release matches what was built.
+              await github.rest.git.updateRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `tags/${tag}`,
+                sha: context.sha,
+                force: true,
+              });
+              core.info(`moved existing ${tag} to ${context.sha}`);
             }
 
   build:
