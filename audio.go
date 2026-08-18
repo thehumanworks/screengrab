@@ -15,31 +15,49 @@ type audioArtifact struct {
 	Error           string  `json:"error,omitempty"`
 }
 
-type microphoneRecorder struct {
+type platformAudioTap interface {
+	currentTime() float64
+	stop() (float64, error)
+}
+
+type audioRecorder struct {
 	mu       sync.Mutex
-	platform *platformMicrophone
+	platform platformAudioTap
 	path     string
+	label    string
 	stopped  bool
 	artifact audioArtifact
 	stopErr  error
 }
 
-func startMicrophoneRecorder(path string) (*microphoneRecorder, error) {
-	platform, err := startPlatformMicrophone(path)
+func startMicrophoneRecorder(path string) (*audioRecorder, error) {
+	return startAudioRecorder(path, "microphone", func() (platformAudioTap, error) {
+		return startPlatformMicrophone(path)
+	})
+}
+
+func startSystemAudioRecorder(path string, src Source) (*audioRecorder, error) {
+	return startAudioRecorder(path, "system audio", func() (platformAudioTap, error) {
+		return startPlatformSystemAudio(path, src)
+	})
+}
+
+func startAudioRecorder(path, label string, start func() (platformAudioTap, error)) (*audioRecorder, error) {
+	platform, err := start()
 	if err != nil {
 		if chmodErr := os.Chmod(path, 0o600); chmodErr != nil && !os.IsNotExist(chmodErr) {
-			return nil, fmt.Errorf("%w; secure partial microphone output %q: %v", err, path, chmodErr)
+			return nil, fmt.Errorf("%w; secure partial %s output %q: %v", err, label, path, chmodErr)
 		}
 		return nil, err
 	}
 	if err := os.Chmod(path, 0o600); err != nil {
 		_, _ = platform.stop()
-		return nil, fmt.Errorf("secure microphone output %q: %w", path, err)
+		return nil, fmt.Errorf("secure %s output %q: %w", label, path, err)
 	}
-	return &microphoneRecorder{platform: platform, path: path}, nil
+	return &audioRecorder{platform: platform, path: path, label: label}, nil
 }
 
-func (r *microphoneRecorder) CurrentTime() float64 {
+func (r *audioRecorder) CurrentTime() float64 {
 	if r == nil {
 		return 0
 	}
@@ -51,7 +69,7 @@ func (r *microphoneRecorder) CurrentTime() float64 {
 	return r.platform.currentTime()
 }
 
-func (r *microphoneRecorder) Stop() (audioArtifact, error) {
+func (r *audioRecorder) Stop() (audioArtifact, error) {
 	if r == nil {
 		return audioArtifact{}, nil
 	}
@@ -72,11 +90,11 @@ func (r *microphoneRecorder) Stop() (audioArtifact, error) {
 	if err != nil {
 		r.stopErr = err
 	} else if duration <= 0 {
-		r.stopErr = fmt.Errorf("microphone produced no audio samples")
+		r.stopErr = fmt.Errorf("%s produced no audio samples", r.label)
 	} else if info, statErr := os.Stat(r.path); statErr != nil || info.Size() == 0 {
 		r.stopErr = statErr
 		if r.stopErr == nil {
-			r.stopErr = fmt.Errorf("microphone output is empty")
+			r.stopErr = fmt.Errorf("%s output is empty", r.label)
 		}
 	}
 	if r.stopErr != nil {
@@ -84,4 +102,22 @@ func (r *microphoneRecorder) Stop() (audioArtifact, error) {
 		r.artifact.Error = r.stopErr.Error()
 	}
 	return r.artifact, r.stopErr
+}
+
+// finishAudio stops a recorder and cross-checks the frame timeline against the
+// recorded duration so a clock that drifted or stalled is surfaced as a failed
+// artifact instead of silently misaligned offsets.
+func finishAudio(rec *audioRecorder, timeline []frameTiming, label string, offset func(frameTiming) *float64) (*audioArtifact, error) {
+	if rec == nil {
+		return nil, nil
+	}
+	artifact, err := rec.Stop()
+	if err == nil {
+		if verr := validateFrameTimeline(timeline, artifact.DurationSeconds, label, offset); verr != nil {
+			err = verr
+			artifact.Status = "failed"
+			artifact.Error = verr.Error()
+		}
+	}
+	return &artifact, err
 }
