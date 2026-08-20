@@ -204,9 +204,17 @@ type RecordingState struct {
 }
 
 func (s *CaptureService) StartRecording(req RecordRequest) error {
-	if s.recording.Load() {
+	// Claim the recording slot atomically so two racing Start clicks cannot
+	// both open the same audio files; release it on any setup failure.
+	if !s.recording.CompareAndSwap(false, true) {
 		return errors.New("already recording")
 	}
+	started := false
+	defer func() {
+		if !started {
+			s.recording.Store(false)
+		}
+	}()
 	if req.FPS <= 0 {
 		req.FPS = defaultFPS
 	}
@@ -238,7 +246,9 @@ func (s *CaptureService) StartRecording(req RecordRequest) error {
 		return err
 	}
 
-	dir := filepath.Join(req.Output, "capture-"+time.Now().Format("20060102-150405"))
+	// Millisecond precision keeps back-to-back recordings from landing in
+	// the same directory and truncating each other's audio artifacts.
+	dir := filepath.Join(req.Output, "capture-"+time.Now().Format("20060102-150405.000"))
 	anyAudio := req.Microphone || req.SystemAudio
 	dirMode := os.FileMode(0o755)
 	if anyAudio {
@@ -275,12 +285,12 @@ func (s *CaptureService) StartRecording(req RecordRequest) error {
 	s.lastError = ""
 	s.mu.Unlock()
 	s.stopFlag.Store(false)
-	s.recording.Store(true)
 	s.transcribing.Store(false)
 	s.microphoneActive.Store(req.Microphone)
 	s.systemAudioActive.Store(req.SystemAudio)
 	s.recordStart = time.Now()
 
+	started = true
 	go s.captureLoop(req, src, mic, sys, resolvedLocale, transcriptPreflightErr)
 	return nil
 }

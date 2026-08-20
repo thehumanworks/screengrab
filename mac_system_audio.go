@@ -16,9 +16,19 @@ package main
 // System-audio capture rides the same ScreenCaptureKit permission as screen
 // capture: an SCStream with capturesAudio delivers CMSampleBuffers of
 // whatever the filtered content is playing. A display filter hears all app
-// audio; a desktopIndependentWindow filter hears only the owning app. There
+// audio; window sources scope the filter to the window's owning application
+// (initWithDisplay:includingApplications:) because a desktopIndependentWindow
+// filter captures pixels but does not reliably produce an audio stream. There
 // is no separate TCC prompt — Screen Recording covers it — which keeps the
 // "silent capture never asks for audio permissions" invariant intact.
+//
+// SCK only delivers audio buffers while the captured content is actually
+// rendering sound, so every buffer is placed on the host-clock timeline
+// anchored at stream start: wall-clock gaps (quiet app, paused playback) are
+// filled with silence and the tail is padded at stop. The file's timeline
+// therefore matches the frame timeline instead of compressing silence away,
+// and a source that never played anything yields a valid silent track rather
+// than a "produced no audio samples" failure.
 
 typedef struct {
     int ok;
@@ -78,6 +88,82 @@ static AVAudioFormat *sg_sys_format = nil;
 static NSString *sg_sys_path = nil;
 static long long sg_sys_frames = 0;
 static NSString *sg_sys_write_error = nil;
+static CMTime sg_sys_epoch;
+static int sg_sys_epoch_valid = 0;
+
+// Caller must hold @synchronized([SGSystemAudioWriter class]).
+static BOOL sg_sys_create_file_locked(AVAudioFormat *streamFormat) {
+    if (sg_sys_path == nil) return NO;
+    if (streamFormat == nil || streamFormat.sampleRate <= 0 || streamFormat.channelCount == 0) {
+        sg_sys_write_error = @"unsupported system audio stream format";
+        return NO;
+    }
+    NSDictionary *settings = @{
+        AVFormatIDKey: @(kAudioFormatLinearPCM),
+        AVSampleRateKey: @(streamFormat.sampleRate),
+        AVNumberOfChannelsKey: @(streamFormat.channelCount),
+        AVLinearPCMBitDepthKey: @16,
+        AVLinearPCMIsFloatKey: @NO,
+        AVLinearPCMIsBigEndianKey: @NO,
+        AVLinearPCMIsNonInterleaved: @NO,
+    };
+    NSError *error = nil;
+    AVAudioFile *file = [[AVAudioFile alloc]
+        initForWriting:[NSURL fileURLWithPath:sg_sys_path]
+              settings:settings
+          commonFormat:streamFormat.commonFormat
+           interleaved:streamFormat.isInterleaved
+                 error:&error];
+    if (file == nil) {
+        sg_sys_write_error = error == nil
+            ? @"could not create system audio output file"
+            : [NSString stringWithFormat:@"create system audio output file: %@", error.localizedDescription];
+        return NO;
+    }
+    sg_sys_file = file;
+    sg_sys_format = streamFormat;
+    return YES;
+}
+
+// Caller must hold @synchronized([SGSystemAudioWriter class]).
+static BOOL sg_sys_write_silence_locked(long long frames) {
+    if (frames <= 0 || sg_sys_file == nil || sg_sys_format == nil) return YES;
+    AVAudioFrameCount chunk = (AVAudioFrameCount)sg_sys_format.sampleRate;
+    if (chunk == 0) chunk = 4096;
+    if ((long long)chunk > frames) chunk = (AVAudioFrameCount)frames;
+    AVAudioPCMBuffer *silence = [[AVAudioPCMBuffer alloc] initWithPCMFormat:sg_sys_format
+                                                              frameCapacity:chunk];
+    if (silence == nil) {
+        sg_sys_write_error = @"could not allocate system audio silence buffer";
+        return NO;
+    }
+    long long remaining = frames;
+    while (remaining > 0) {
+        AVAudioFrameCount n = remaining < (long long)chunk ? (AVAudioFrameCount)remaining : chunk;
+        silence.frameLength = n;
+        AudioBufferList *abl = silence.mutableAudioBufferList;
+        for (UInt32 i = 0; i < abl->mNumberBuffers; i++) {
+            if (abl->mBuffers[i].mData != NULL) {
+                memset(abl->mBuffers[i].mData, 0, abl->mBuffers[i].mDataByteSize);
+            }
+        }
+        NSError *error = nil;
+        if (![sg_sys_file writeFromBuffer:silence error:&error]) {
+            sg_sys_write_error = error.localizedDescription ?: @"system audio silence write failed";
+            return NO;
+        }
+        sg_sys_frames += n;
+        remaining -= n;
+    }
+    return YES;
+}
+
+static double sg_sys_elapsed_since_epoch(void) {
+    if (!sg_sys_epoch_valid) return 0;
+    CMTime now = CMClockGetTime(CMClockGetHostTimeClock());
+    double elapsed = CMTimeGetSeconds(CMTimeSubtract(now, sg_sys_epoch));
+    return elapsed > 0 ? elapsed : 0;
+}
 
 @implementation SGSystemAudioWriter
 
@@ -102,33 +188,25 @@ static NSString *sg_sys_write_error = nil;
             // The stream's PCM layout is only known once the first buffer
             // arrives, so the output file is created lazily to match it.
             AVAudioFormat *streamFormat = [[AVAudioFormat alloc] initWithStreamDescription:asbd];
-            if (streamFormat == nil || streamFormat.sampleRate <= 0) {
-                sg_sys_write_error = @"unsupported system audio stream format";
-                return;
+            if (!sg_sys_create_file_locked(streamFormat)) return;
+        }
+
+        if (sg_sys_epoch_valid) {
+            CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+            if (CMTIME_IS_VALID(pts)) {
+                double at = CMTimeGetSeconds(CMTimeSubtract(pts, sg_sys_epoch));
+                if (at > 0) {
+                    long long expected = (long long)(at * sg_sys_format.sampleRate);
+                    long long gap = expected - sg_sys_frames;
+                    // Fill only real playback gaps; sub-100ms jitter rides on
+                    // the natural buffer cadence. The upper bound guards
+                    // against a bogus timestamp flooding the disk.
+                    if (gap > (long long)(sg_sys_format.sampleRate / 10) &&
+                        gap < (long long)sg_sys_format.sampleRate * 60 * 60 * 24) {
+                        if (!sg_sys_write_silence_locked(gap)) return;
+                    }
+                }
             }
-            NSDictionary *settings = @{
-                AVFormatIDKey: @(kAudioFormatLinearPCM),
-                AVSampleRateKey: @(streamFormat.sampleRate),
-                AVNumberOfChannelsKey: @(streamFormat.channelCount),
-                AVLinearPCMBitDepthKey: @16,
-                AVLinearPCMIsFloatKey: @NO,
-                AVLinearPCMIsBigEndianKey: @NO,
-                AVLinearPCMIsNonInterleaved: @NO,
-            };
-            AVAudioFile *file = [[AVAudioFile alloc]
-                initForWriting:[NSURL fileURLWithPath:sg_sys_path]
-                      settings:settings
-                  commonFormat:streamFormat.commonFormat
-                   interleaved:streamFormat.isInterleaved
-                         error:&error];
-            if (file == nil) {
-                sg_sys_write_error = error == nil
-                    ? @"could not create system audio output file"
-                    : [NSString stringWithFormat:@"create system audio output file: %@", error.localizedDescription];
-                return;
-            }
-            sg_sys_file = file;
-            sg_sys_format = streamFormat;
         }
 
         AVAudioPCMBuffer *pcm = [[AVAudioPCMBuffer alloc] initWithPCMFormat:sg_sys_format
@@ -179,6 +257,11 @@ static sg_sys_result sg_sysaudio_start(const char *path, int is_window, uint32_t
             return sg_sys_error_result(@"could not enumerate shareable content (grant Screen Recording permission)");
         }
 
+        NSArray<SCDisplay *> *displays = content.displays;
+        if ([displays count] == 0) {
+            return sg_sys_error_result(@"no displays available for system audio capture");
+        }
+
         SCContentFilter *filter = nil;
         if (is_window) {
             SCWindow *target = nil;
@@ -188,12 +271,14 @@ static sg_sys_result sg_sysaudio_start(const char *path, int is_window, uint32_t
             if (target == nil) {
                 return sg_sys_error_result(@"window not found in SCShareableContent (may have closed or you may need to grant Screen Recording permission)");
             }
-            filter = [[SCContentFilter alloc] initWithDesktopIndependentWindow:target];
-        } else {
-            NSArray<SCDisplay *> *displays = content.displays;
-            if ([displays count] == 0) {
-                return sg_sys_error_result(@"no displays available for system audio capture");
+            SCRunningApplication *owner = target.owningApplication;
+            if (owner == nil) {
+                return sg_sys_error_result(@"window has no owning application to scope system audio to");
             }
+            filter = [[SCContentFilter alloc] initWithDisplay:displays[0]
+                                        includingApplications:@[owner]
+                                             exceptingWindows:@[]];
+        } else {
             SCDisplay *display = displays[0];
             if (display_index >= 0 && display_index < (int)[displays count]) {
                 display = displays[display_index];
@@ -236,6 +321,7 @@ static sg_sys_result sg_sysaudio_start(const char *path, int is_window, uint32_t
             sg_sys_path = filePath;
             sg_sys_frames = 0;
             sg_sys_write_error = nil;
+            sg_sys_epoch_valid = 0;
         }
 
         __block NSString *startError = nil;
@@ -254,8 +340,14 @@ static sg_sys_result sg_sysaudio_start(const char *path, int is_window, uint32_t
                 sg_sys_file = nil;
                 sg_sys_format = nil;
                 sg_sys_path = nil;
+                sg_sys_epoch_valid = 0;
             }
             return sg_sys_error_result([NSString stringWithFormat:@"start system audio capture: %@", startError]);
+        }
+
+        @synchronized([SGSystemAudioWriter class]) {
+            sg_sys_epoch = CMClockGetTime(CMClockGetHostTimeClock());
+            sg_sys_epoch_valid = 1;
         }
 
         sg_sys_result result = {1, 0, NULL};
@@ -265,8 +357,10 @@ static sg_sys_result sg_sysaudio_start(const char *path, int is_window, uint32_t
 
 static double sg_sysaudio_current_time(void) {
     @synchronized([SGSystemAudioWriter class]) {
-        if (sg_sys_format == nil || sg_sys_format.sampleRate <= 0) return 0;
-        return (double)sg_sys_frames / sg_sys_format.sampleRate;
+        if (sg_sys_stream == nil) return 0;
+        // Buffers are placed on the host-clock timeline (silence fills the
+        // gaps), so the track clock is host time since stream start.
+        return sg_sys_elapsed_since_epoch();
     }
 }
 
@@ -290,6 +384,24 @@ static sg_sys_result sg_sysaudio_stop(void) {
         dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)));
 
         @synchronized([SGSystemAudioWriter class]) {
+            if (sg_sys_write_error == nil && sg_sys_epoch_valid) {
+                double elapsed = sg_sys_elapsed_since_epoch();
+                if (elapsed > 0) {
+                    if (sg_sys_file == nil) {
+                        // Nothing ever played: a quiet source is a valid
+                        // recording, so persist a silent track matching the
+                        // configured stream shape instead of failing.
+                        AVAudioFormat *fallback = [[AVAudioFormat alloc]
+                            initStandardFormatWithSampleRate:48000 channels:2];
+                        sg_sys_create_file_locked(fallback);
+                    }
+                    if (sg_sys_file != nil && sg_sys_format != nil && sg_sys_format.sampleRate > 0) {
+                        long long expected = (long long)(elapsed * sg_sys_format.sampleRate);
+                        sg_sys_write_silence_locked(expected - sg_sys_frames);
+                    }
+                }
+            }
+
             double duration = 0;
             if (sg_sys_format != nil && sg_sys_format.sampleRate > 0) {
                 duration = (double)sg_sys_frames / sg_sys_format.sampleRate;
@@ -303,6 +415,7 @@ static sg_sys_result sg_sysaudio_stop(void) {
             sg_sys_path = nil;
             sg_sys_frames = 0;
             sg_sys_write_error = nil;
+            sg_sys_epoch_valid = 0;
             if (writeError != nil) {
                 sg_sys_result failed = sg_sys_error_result(writeError);
                 failed.duration = duration;
