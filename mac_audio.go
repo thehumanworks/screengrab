@@ -17,13 +17,20 @@ typedef struct {
     char *err;
 } sg_audio_result;
 
+// The tap hands us buffers the engine owns and reuses; every buffer is
+// deep-copied ("pinned") in the tap and the pinned copy is written on a
+// dedicated serial queue. The render thread therefore never blocks on disk
+// I/O and no buffer can be recycled by the engine before its samples are on
+// disk. sg_audio_file and sg_audio_converter are only touched on that queue
+// once recording is live; everything else is guarded by the class lock.
 static AVAudioEngine *sg_audio_engine = nil;
-static AVAudioInputNode *sg_audio_input = nil;
 static AVAudioFile *sg_audio_file = nil;
-static AVAudioFormat *sg_audio_format = nil;
-static AVAudioFramePosition sg_audio_frames = 0;
+static AVAudioConverter *sg_audio_converter = nil;
+static dispatch_queue_t sg_audio_write_queue = nil;
+static double sg_audio_seconds = 0;
 static NSString *sg_audio_write_error = nil;
 static BOOL sg_audio_stopping = NO;
+static id sg_audio_observer = nil;
 
 static char *sg_audio_copy_string(NSString *s) {
     if (s == nil) return NULL;
@@ -59,150 +66,288 @@ static int sg_request_microphone_access(void) {
     return wait_result == 0 && granted ? 1 : 0;
 }
 
+static void sg_audio_set_write_error(NSString *message) {
+    if (message == nil) return;
+    @synchronized([AVAudioEngine class]) {
+        if (sg_audio_write_error == nil) sg_audio_write_error = message;
+    }
+}
+
+static AVAudioPCMBuffer *sg_audio_pin_buffer(AVAudioPCMBuffer *buffer) {
+    if (buffer == nil || buffer.frameLength == 0) return nil;
+    AVAudioPCMBuffer *pinned = [[AVAudioPCMBuffer alloc] initWithPCMFormat:buffer.format
+                                                             frameCapacity:buffer.frameLength];
+    if (pinned == nil) return nil;
+    pinned.frameLength = buffer.frameLength;
+    const AudioBufferList *src = buffer.audioBufferList;
+    AudioBufferList *dst = pinned.mutableAudioBufferList;
+    for (UInt32 i = 0; i < src->mNumberBuffers && i < dst->mNumberBuffers; i++) {
+        UInt32 n = src->mBuffers[i].mDataByteSize;
+        if (n > dst->mBuffers[i].mDataByteSize) n = dst->mBuffers[i].mDataByteSize;
+        if (src->mBuffers[i].mData != NULL && dst->mBuffers[i].mData != NULL && n > 0) {
+            memcpy(dst->mBuffers[i].mData, src->mBuffers[i].mData, n);
+        }
+    }
+    return pinned;
+}
+
+// Runs on the writer queue only. When the input device changed mid-recording
+// (AirPods connecting, default-device switch) the tap format no longer
+// matches the file's processing format, so route through an AVAudioConverter
+// instead of dropping the rest of the take.
+static void sg_audio_write_pinned(AVAudioPCMBuffer *pinned) {
+    if (pinned == nil || sg_audio_file == nil) return;
+    AVAudioPCMBuffer *out = pinned;
+    if (![pinned.format isEqual:sg_audio_file.processingFormat]) {
+        if (sg_audio_converter == nil || ![sg_audio_converter.inputFormat isEqual:pinned.format]) {
+            sg_audio_converter = [[AVAudioConverter alloc] initFromFormat:pinned.format
+                                                                 toFormat:sg_audio_file.processingFormat];
+        }
+        if (sg_audio_converter == nil) {
+            sg_audio_set_write_error(@"could not convert microphone audio after a device change");
+            return;
+        }
+        double ratio = sg_audio_file.processingFormat.sampleRate / pinned.format.sampleRate;
+        AVAudioFrameCount capacity = (AVAudioFrameCount)((double)pinned.frameLength * ratio) + 64;
+        AVAudioPCMBuffer *converted = [[AVAudioPCMBuffer alloc]
+            initWithPCMFormat:sg_audio_file.processingFormat frameCapacity:capacity];
+        if (converted == nil) {
+            sg_audio_set_write_error(@"could not allocate microphone conversion buffer");
+            return;
+        }
+        __block BOOL provided = NO;
+        NSError *convertError = nil;
+        AVAudioConverterOutputStatus status = [sg_audio_converter
+            convertToBuffer:converted
+                      error:&convertError
+         withInputFromBlock:^AVAudioBuffer *(AVAudioPacketCount inNumberOfPackets,
+                                             AVAudioConverterInputStatus *outStatus) {
+            (void)inNumberOfPackets;
+            if (provided) {
+                *outStatus = AVAudioConverterInputStatus_NoDataNow;
+                return nil;
+            }
+            provided = YES;
+            *outStatus = AVAudioConverterInputStatus_HaveData;
+            return pinned;
+        }];
+        if (status == AVAudioConverterOutputStatus_Error) {
+            sg_audio_set_write_error(convertError.localizedDescription ?: @"microphone format conversion failed");
+            return;
+        }
+        if (converted.frameLength == 0) return;
+        out = converted;
+    }
+    NSError *writeError = nil;
+    if (![sg_audio_file writeFromBuffer:out error:&writeError]) {
+        sg_audio_set_write_error(writeError.localizedDescription ?: @"microphone buffer write failed");
+    }
+}
+
+// The error-returning installTapOnBus variant exists only in the macOS 27
+// SDK headers; referencing its selector is a hard compile error against the
+// macOS 26 SDK CI builds (@available guards runtime, not selector
+// visibility). The exception-throwing variant exists on every supported
+// SDK, so use it unconditionally and convert the exception into an NSError.
+static BOOL sg_audio_install_tap(AVAudioInputNode *input, NSError **outError) {
+    @try {
+        [input installTapOnBus:0 bufferSize:4096 format:nil block:^(AVAudioPCMBuffer *buffer, AVAudioTime *when) {
+            (void)when;
+            if (buffer == nil || buffer.frameLength == 0) return;
+            dispatch_queue_t queue = nil;
+            @synchronized([AVAudioEngine class]) {
+                if (sg_audio_stopping || sg_audio_write_queue == nil) return;
+                queue = sg_audio_write_queue;
+                if (buffer.format.sampleRate > 0) {
+                    // The mic clock advances at capture time, not write time,
+                    // so frame offsets stay aligned even if disk writes lag.
+                    sg_audio_seconds += (double)buffer.frameLength / buffer.format.sampleRate;
+                }
+            }
+            AVAudioPCMBuffer *pinned = sg_audio_pin_buffer(buffer);
+            if (pinned == nil) {
+                sg_audio_set_write_error(@"could not pin microphone buffer");
+                return;
+            }
+            dispatch_async(queue, ^{ sg_audio_write_pinned(pinned); });
+        }];
+        return YES;
+    } @catch (NSException *exception) {
+        if (outError != NULL) {
+            *outError = [NSError errorWithDomain:@"io.thehumanworks.screengrab.audio"
+                                            code:1
+                                        userInfo:@{NSLocalizedDescriptionKey: exception.reason ?: @"could not install microphone tap"}];
+        }
+        return NO;
+    }
+}
+
 static sg_audio_result sg_audio_start(const char *path) {
     @autoreleasepool {
         @synchronized([AVAudioEngine class]) {
-            if (sg_audio_engine != nil && sg_audio_engine.isRunning) {
+            if (sg_audio_engine != nil) {
                 return sg_audio_error(@"microphone is already recording");
             }
-            if (!sg_request_microphone_access()) {
-                return sg_audio_error(@"microphone permission was not granted");
-            }
+        }
+        if (!sg_request_microphone_access()) {
+            return sg_audio_error(@"microphone permission was not granted");
+        }
 
-            NSString *filePath = [NSString stringWithUTF8String:path];
-            if (filePath == nil) return sg_audio_error(@"invalid microphone output path");
-            if ([AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio] == nil) {
-                return sg_audio_error(@"no default microphone input device is available");
-            }
-            NSURL *url = [NSURL fileURLWithPath:filePath];
-            AVAudioEngine *engine = [[AVAudioEngine alloc] init];
-            AVAudioInputNode *input = engine.inputNode;
-            AVAudioFormat *inputFormat = [input outputFormatForBus:0];
-            if (inputFormat.sampleRate <= 0 || inputFormat.channelCount == 0) {
-                return sg_audio_error(@"default microphone has no active audio format");
-            }
-            NSDictionary *settings = @{
-                AVFormatIDKey: @(kAudioFormatLinearPCM),
-                AVSampleRateKey: @(inputFormat.sampleRate),
-                AVNumberOfChannelsKey: @(inputFormat.channelCount),
-                AVLinearPCMBitDepthKey: @16,
-                AVLinearPCMIsFloatKey: @NO,
-                AVLinearPCMIsBigEndianKey: @NO,
-                AVLinearPCMIsNonInterleaved: @NO,
-            };
+        NSString *filePath = [NSString stringWithUTF8String:path];
+        if (filePath == nil) return sg_audio_error(@"invalid microphone output path");
+        if ([AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio] == nil) {
+            return sg_audio_error(@"no default microphone input device is available");
+        }
+        NSURL *url = [NSURL fileURLWithPath:filePath];
+        AVAudioEngine *engine = [[AVAudioEngine alloc] init];
+        AVAudioInputNode *input = engine.inputNode;
+        AVAudioFormat *inputFormat = [input outputFormatForBus:0];
+        if (inputFormat.sampleRate <= 0 || inputFormat.channelCount == 0) {
+            return sg_audio_error(@"default microphone has no active audio format");
+        }
+        NSDictionary *settings = @{
+            AVFormatIDKey: @(kAudioFormatLinearPCM),
+            AVSampleRateKey: @(inputFormat.sampleRate),
+            AVNumberOfChannelsKey: @(inputFormat.channelCount),
+            AVLinearPCMBitDepthKey: @16,
+            AVLinearPCMIsFloatKey: @NO,
+            AVLinearPCMIsBigEndianKey: @NO,
+            AVLinearPCMIsNonInterleaved: @NO,
+        };
 
-            NSError *error = nil;
-            AVAudioFile *file = [[AVAudioFile alloc]
-                initForWriting:url
-                      settings:settings
-                  commonFormat:AVAudioPCMFormatFloat32
-                   interleaved:NO
-                         error:&error];
-            if (file == nil) {
-                NSString *message = error == nil
-                    ? @"could not create microphone output file"
-                    : [NSString stringWithFormat:@"create microphone output file: %@", error.localizedDescription];
-                return sg_audio_error(message);
-            }
+        NSError *error = nil;
+        AVAudioFile *file = [[AVAudioFile alloc]
+            initForWriting:url
+                  settings:settings
+              commonFormat:AVAudioPCMFormatFloat32
+               interleaved:NO
+                     error:&error];
+        if (file == nil) {
+            NSString *message = error == nil
+                ? @"could not create microphone output file"
+                : [NSString stringWithFormat:@"create microphone output file: %@", error.localizedDescription];
+            return sg_audio_error(message);
+        }
 
+        dispatch_queue_t queue = dispatch_queue_create("io.thehumanworks.screengrab.micwrite", DISPATCH_QUEUE_SERIAL);
+        @synchronized([AVAudioEngine class]) {
+            if (sg_audio_engine != nil) {
+                return sg_audio_error(@"microphone is already recording");
+            }
             sg_audio_engine = engine;
-            sg_audio_input = input;
             sg_audio_file = file;
-            sg_audio_format = inputFormat;
-            sg_audio_frames = 0;
+            sg_audio_converter = nil;
+            sg_audio_write_queue = queue;
+            sg_audio_seconds = 0;
             sg_audio_write_error = nil;
             sg_audio_stopping = NO;
-
-            AVAudioNodeTapBlock tapBlock = ^(AVAudioPCMBuffer *buffer, AVAudioTime *when) {
-                (void)when;
-                @synchronized([AVAudioEngine class]) {
-                    if (sg_audio_stopping || sg_audio_file == nil) return;
-                    NSError *writeError = nil;
-                    if (![sg_audio_file writeFromBuffer:buffer error:&writeError]) {
-                        sg_audio_write_error = writeError.localizedDescription ?: @"microphone buffer write failed";
-                        return;
-                    }
-                    sg_audio_frames += buffer.frameLength;
-                }
-            };
-            // The error-returning installTapOnBus variant exists only in the
-            // macOS 27 SDK headers; referencing its selector is a hard compile
-            // error against the macOS 26 SDK CI builds with (@available guards
-            // runtime, not selector visibility). The exception-throwing
-            // variant exists on every supported SDK, so use it unconditionally
-            // and convert the exception into an NSError.
-            BOOL installed = NO;
-            @try {
-                [input installTapOnBus:0 bufferSize:4096 format:nil block:tapBlock];
-                installed = YES;
-            } @catch (NSException *exception) {
-                error = [NSError errorWithDomain:@"io.thehumanworks.screengrab.audio"
-                                             code:1
-                                         userInfo:@{NSLocalizedDescriptionKey: exception.reason ?: @"could not install microphone tap"}];
-            }
-            if (!installed) {
-                sg_audio_engine = nil;
-                sg_audio_input = nil;
-                sg_audio_file = nil;
-                sg_audio_format = nil;
-                NSString *message = error == nil
-                    ? @"could not install microphone tap"
-                    : [NSString stringWithFormat:@"install microphone tap: %@", error.localizedDescription];
-                return sg_audio_error(message);
-            }
-
-            [engine prepare];
-            if (![engine startAndReturnError:&error]) {
-                [input removeTapOnBus:0];
-                sg_audio_engine = nil;
-                sg_audio_input = nil;
-                sg_audio_file = nil;
-                sg_audio_format = nil;
-                NSString *message = error == nil
-                    ? @"could not start microphone audio engine"
-                    : [NSString stringWithFormat:@"start microphone audio engine: %@", error.localizedDescription];
-                return sg_audio_error(message);
-            }
-            sg_audio_result result = {1, 0, NULL};
-            return result;
         }
+
+        NSError *tapError = nil;
+        if (!sg_audio_install_tap(input, &tapError)) {
+            @synchronized([AVAudioEngine class]) {
+                sg_audio_engine = nil;
+                sg_audio_write_queue = nil;
+            }
+            sg_audio_file = nil;
+            NSString *message = tapError == nil
+                ? @"could not install microphone tap"
+                : [NSString stringWithFormat:@"install microphone tap: %@", tapError.localizedDescription];
+            return sg_audio_error(message);
+        }
+
+        // A configuration change (device switch, sample-rate change) stops
+        // the engine silently; without this restart the file would simply end
+        // at the moment the user's headphones connected.
+        sg_audio_observer = [[NSNotificationCenter defaultCenter]
+            addObserverForName:AVAudioEngineConfigurationChangeNotification
+                        object:engine
+                         queue:nil
+                    usingBlock:^(NSNotification *note) {
+            (void)note;
+            @synchronized([AVAudioEngine class]) {
+                if (sg_audio_stopping || sg_audio_engine == nil) return;
+                AVAudioInputNode *liveInput = sg_audio_engine.inputNode;
+                [liveInput removeTapOnBus:0];
+                NSError *retapError = nil;
+                if (!sg_audio_install_tap(liveInput, &retapError)) {
+                    if (sg_audio_write_error == nil) {
+                        sg_audio_write_error = retapError.localizedDescription
+                            ?: @"could not reinstall microphone tap after a device change";
+                    }
+                    return;
+                }
+                NSError *restartError = nil;
+                if (![sg_audio_engine startAndReturnError:&restartError]) {
+                    if (sg_audio_write_error == nil) {
+                        sg_audio_write_error = [NSString stringWithFormat:@"restart microphone after device change: %@",
+                            restartError.localizedDescription ?: @"unknown error"];
+                    }
+                }
+            }
+        }];
+
+        [engine prepare];
+        if (![engine startAndReturnError:&error]) {
+            [[NSNotificationCenter defaultCenter] removeObserver:sg_audio_observer];
+            sg_audio_observer = nil;
+            [input removeTapOnBus:0];
+            @synchronized([AVAudioEngine class]) {
+                sg_audio_engine = nil;
+                sg_audio_write_queue = nil;
+            }
+            sg_audio_file = nil;
+            NSString *message = error == nil
+                ? @"could not start microphone audio engine"
+                : [NSString stringWithFormat:@"start microphone audio engine: %@", error.localizedDescription];
+            return sg_audio_error(message);
+        }
+        sg_audio_result result = {1, 0, NULL};
+        return result;
     }
 }
 
 static double sg_audio_current_time(void) {
     @synchronized([AVAudioEngine class]) {
-        if (sg_audio_format == nil || sg_audio_format.sampleRate <= 0) return 0;
-        return (double)sg_audio_frames / sg_audio_format.sampleRate;
+        return sg_audio_seconds;
     }
 }
 
 static sg_audio_result sg_audio_stop(void) {
     @autoreleasepool {
-        __block AVAudioEngine *engine = nil;
-        __block AVAudioInputNode *input = nil;
+        AVAudioEngine *engine = nil;
+        dispatch_queue_t queue = nil;
         @synchronized([AVAudioEngine class]) {
             if (sg_audio_engine == nil) {
                 return sg_audio_error(@"microphone recorder is not running");
             }
             sg_audio_stopping = YES;
             engine = sg_audio_engine;
-            input = sg_audio_input;
+            queue = sg_audio_write_queue;
         }
 
-        [input removeTapOnBus:0];
+        if (sg_audio_observer != nil) {
+            [[NSNotificationCenter defaultCenter] removeObserver:sg_audio_observer];
+            sg_audio_observer = nil;
+        }
+        [engine.inputNode removeTapOnBus:0];
         [engine stop];
+        if (queue != nil) {
+            // Drain every pinned buffer, then close the file on the writer
+            // queue itself so no straggling write can race the close. Closing
+            // (releasing) the AVAudioFile is what finalizes the WAV header.
+            dispatch_sync(queue, ^{
+                sg_audio_file = nil;
+                sg_audio_converter = nil;
+            });
+        }
 
         @synchronized([AVAudioEngine class]) {
-            double duration = 0;
-            if (sg_audio_format != nil && sg_audio_format.sampleRate > 0) {
-                duration = (double)sg_audio_frames / sg_audio_format.sampleRate;
-            }
+            double duration = sg_audio_seconds;
             NSString *writeError = sg_audio_write_error;
             sg_audio_engine = nil;
-            sg_audio_input = nil;
-            sg_audio_file = nil;
-            sg_audio_format = nil;
-            sg_audio_frames = 0;
+            sg_audio_write_queue = nil;
+            sg_audio_seconds = 0;
             sg_audio_write_error = nil;
             sg_audio_stopping = NO;
             if (writeError != nil) {

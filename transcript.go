@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 var errTranscriptionUnavailable = errors.New("on-device transcription is unavailable")
@@ -38,8 +39,62 @@ func prepareTranscription(locale string) (string, error) {
 	return preparePlatformTranscription(locale)
 }
 
+// On-device recognition is only dependable up to roughly a minute of audio —
+// beyond that it silently keeps a fraction of the track — so longer
+// recordings are transcribed in bounded chunks and re-merged on the full
+// timeline.
+const transcriptChunkSeconds = 60.0
+
+func transcribeAudioTrack(audioPath, locale string, audioDuration float64) (transcriptDocument, error) {
+	if audioDuration <= transcriptChunkSeconds {
+		return transcribePlatformAudio(audioPath, locale)
+	}
+	chunks, err := splitWAVForTranscription(audioPath, transcriptChunkSeconds)
+	if err != nil {
+		// A container we cannot slice still gets a single-shot attempt
+		// rather than no transcript at all.
+		return transcribePlatformAudio(audioPath, locale)
+	}
+	defer func() {
+		for _, chunk := range chunks {
+			os.Remove(chunk.Path)
+		}
+	}()
+	docs := make([]transcriptDocument, 0, len(chunks))
+	offsets := make([]float64, 0, len(chunks))
+	for _, chunk := range chunks {
+		doc, err := transcribePlatformAudio(chunk.Path, locale)
+		if err != nil {
+			return doc, err
+		}
+		docs = append(docs, doc)
+		offsets = append(offsets, chunk.OffsetSeconds)
+	}
+	return mergeTranscriptDocuments(docs, offsets), nil
+}
+
+func mergeTranscriptDocuments(docs []transcriptDocument, offsets []float64) transcriptDocument {
+	merged := transcriptDocument{Version: 1, Status: "complete", Segments: []transcriptSegment{}}
+	parts := []string{}
+	for i, doc := range docs {
+		if merged.Locale == "" {
+			merged.Locale = doc.Locale
+		}
+		if text := strings.TrimSpace(doc.Text); text != "" {
+			parts = append(parts, text)
+		}
+		for _, segment := range doc.Segments {
+			segment.StartSeconds += offsets[i]
+			segment.EndSeconds += offsets[i]
+			merged.Segments = append(merged.Segments, segment)
+		}
+	}
+	merged.Text = strings.Join(parts, " ")
+	return merged
+}
+
 func transcribeAndWrite(audioPath, outputDir, baseName, locale string, audioDuration float64) (*transcriptArtifact, error) {
-	doc, err := transcribePlatformAudio(audioPath, locale)
+	doc, err := transcribeAudioTrack(audioPath, locale, audioDuration)
 	if err == nil {
 		err = validateTranscriptDocument(doc, audioDuration)
 	}

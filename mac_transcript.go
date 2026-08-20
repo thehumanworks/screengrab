@@ -78,6 +78,86 @@ static sg_speech_result sg_speech_prepare(const char *requested_locale) {
     }
 }
 
+// On-device recognition delivers a SEQUENCE of per-utterance final results —
+// bestTranscription resets between them — so keeping only the transcription
+// seen at the first isFinal callback truncates the transcript to a single
+// utterance. The collector pins every result as it arrives and only lets the
+// caller proceed when the task itself reports completion.
+@interface SGSpeechCollector : NSObject <SFSpeechRecognitionTaskDelegate>
+@property (nonatomic, strong) NSMutableArray<NSDictionary *> *segments;
+@property (nonatomic, strong) NSMutableArray<NSString *> *parts;
+@property (nonatomic, strong) dispatch_semaphore_t sem;
+@property (nonatomic, strong) NSError *error;
+@property (nonatomic) double baseOffset;
+@property (nonatomic) double lastEnd;
+@end
+
+@implementation SGSpeechCollector
+
+- (instancetype)init {
+    self = [super init];
+    if (self != nil) {
+        _segments = [NSMutableArray array];
+        _parts = [NSMutableArray array];
+        _sem = dispatch_semaphore_create(0);
+        _baseOffset = 0;
+        _lastEnd = 0;
+    }
+    return self;
+}
+
+- (void)speechRecognitionTask:(SFSpeechRecognitionTask *)task
+          didFinishRecognition:(SFSpeechRecognitionResult *)recognitionResult {
+    (void)task;
+    SFTranscription *transcription = recognitionResult.bestTranscription;
+    if (transcription == nil || transcription.segments.count == 0) return;
+    double first = transcription.segments.firstObject.timestamp;
+    // The on-device recognizer restarts its timeline after long utterance
+    // boundaries; when incoming timestamps rewind, rebase them after
+    // everything already emitted so offsets stay absolute and monotonic.
+    if (self.baseOffset + first + 0.05 < self.lastEnd) {
+        self.baseOffset = self.lastEnd;
+    }
+    for (SFTranscriptionSegment *segment in transcription.segments) {
+        double start = self.baseOffset + segment.timestamp;
+        double end = start + segment.duration;
+        if (end > self.lastEnd) self.lastEnd = end;
+        [self.segments addObject:@{
+            @"start_seconds": @(start),
+            @"end_seconds": @(end),
+            @"text": segment.substring ?: @"",
+            @"confidence": @(segment.confidence),
+        }];
+    }
+    if (transcription.formattedString.length > 0) {
+        [self.parts addObject:transcription.formattedString];
+    }
+}
+
+- (void)speechRecognitionTask:(SFSpeechRecognitionTask *)task didFinishSuccessfully:(BOOL)successfully {
+    if (!successfully && self.error == nil && task.error != nil) {
+        self.error = task.error;
+    }
+    dispatch_semaphore_signal(self.sem);
+}
+
+- (void)speechRecognitionTaskWasCancelled:(SFSpeechRecognitionTask *)task {
+    (void)task;
+    if (self.error == nil) {
+        self.error = [NSError errorWithDomain:@"io.thehumanworks.screengrab.speech"
+                                         code:1
+                                     userInfo:@{NSLocalizedDescriptionKey: @"speech recognition task was cancelled"}];
+    }
+    dispatch_semaphore_signal(self.sem);
+}
+
+@end
+
+static BOOL sg_speech_is_no_speech_error(NSError *error) {
+    if (error == nil) return NO;
+    return [error.domain isEqualToString:@"kAFAssistantErrorDomain"] && error.code == 1110;
+}
+
 static sg_speech_result sg_speech_transcribe(const char *audio_path, const char *requested_locale) {
     @autoreleasepool {
         sg_speech_result prepared = sg_speech_prepare(requested_locale);
@@ -91,22 +171,11 @@ static sg_speech_result sg_speech_transcribe(const char *audio_path, const char 
         request.shouldReportPartialResults = NO;
         request.requiresOnDeviceRecognition = YES;
 
-        __block SFTranscription *transcription = nil;
-        __block NSError *recognitionError = nil;
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        __block SFSpeechRecognitionTask *task = nil;
-        task = [recognizer recognitionTaskWithRequest:request resultHandler:^(SFSpeechRecognitionResult *recognitionResult, NSError *error) {
-            if (recognitionResult.isFinal) {
-                transcription = recognitionResult.bestTranscription;
-                dispatch_semaphore_signal(sem);
-            } else if (error != nil) {
-                recognitionError = error;
-                dispatch_semaphore_signal(sem);
-            }
-        }];
+        SGSpeechCollector *collector = [[SGSpeechCollector alloc] init];
+        SFSpeechRecognitionTask *task = [recognizer recognitionTaskWithRequest:request delegate:collector];
 
         long wait_result = dispatch_semaphore_wait(
-            sem,
+            collector.sem,
             dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * 60 * NSEC_PER_SEC))
         );
         if (wait_result != 0) {
@@ -115,27 +184,26 @@ static sg_speech_result sg_speech_transcribe(const char *audio_path, const char 
             prepared.err = sg_speech_copy_string(@"on-device transcription timed out");
             return prepared;
         }
-        if (transcription == nil) {
+
+        // A track with no detectable speech (e.g. a silent system-audio
+        // recording) is a valid empty transcript, not a failure; and a late
+        // recognizer error must not discard the utterances already pinned.
+        if (collector.segments.count == 0 && collector.error != nil &&
+            !sg_speech_is_no_speech_error(collector.error)) {
             prepared.code = 0;
-            prepared.err = sg_speech_copy_string(recognitionError.localizedDescription ?: @"speech recognizer returned no transcript");
+            prepared.err = sg_speech_copy_string(collector.error.localizedDescription ?: @"speech recognizer returned no transcript");
             return prepared;
         }
 
-        NSMutableArray *segments = [NSMutableArray arrayWithCapacity:transcription.segments.count];
-        for (SFTranscriptionSegment *segment in transcription.segments) {
-            [segments addObject:@{
-                @"start_seconds": @(segment.timestamp),
-                @"end_seconds": @(segment.timestamp + segment.duration),
-                @"text": segment.substring ?: @"",
-                @"confidence": @(segment.confidence),
-            }];
-        }
+        NSString *text = collector.parts.count > 0
+            ? [collector.parts componentsJoinedByString:@" "]
+            : @"";
         NSDictionary *document = @{
             @"version": @1,
             @"status": @"complete",
             @"locale": localeID,
-            @"text": transcription.formattedString ?: @"",
-            @"segments": segments,
+            @"text": text,
+            @"segments": collector.segments,
         };
         NSError *jsonError = nil;
         NSData *jsonData = [NSJSONSerialization dataWithJSONObject:document options:NSJSONWritingSortedKeys error:&jsonError];
@@ -146,7 +214,7 @@ static sg_speech_result sg_speech_transcribe(const char *audio_path, const char 
         }
 
         prepared.code = 1;
-        prepared.text = sg_speech_copy_string(transcription.formattedString ?: @"");
+        prepared.text = sg_speech_copy_string(text);
         prepared.json = sg_speech_copy_string([[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding]);
         return prepared;
     }

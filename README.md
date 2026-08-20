@@ -197,6 +197,14 @@ recorded. The two tracks stay separate on purpose — "what the user said" and
 "what the machine played" are distinct signals for a consuming AI agent, and
 each gets its own timed transcript.
 
+Both tracks cover the entire take: microphone buffers are pinned off the
+audio engine's tap and flushed before the file is closed (a mid-recording
+device switch, e.g. AirPods connecting, resumes into the same file), and
+system audio is laid out on a wall-clock timeline with silence filling any
+span where the source played nothing — a quiet source yields a valid silent
+track. Recordings longer than a minute are transcribed in chunks so the
+on-device recognizer cannot silently drop earlier speech.
+
 `transcript.txt` is the readable text; `transcript.json` contains ordered
 segments with start/end times, text, and confidence when macOS supplies it
 (same shape for `system_transcript.*`). Transcription uses Apple's on-device
