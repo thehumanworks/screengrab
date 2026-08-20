@@ -125,19 +125,20 @@ static sg_audio_result sg_audio_start(const char *path) {
                     sg_audio_frames += buffer.frameLength;
                 }
             };
+            // The error-returning installTapOnBus variant exists only in the
+            // macOS 27 SDK headers; referencing its selector is a hard compile
+            // error against the macOS 26 SDK CI builds with (@available guards
+            // runtime, not selector visibility). The exception-throwing
+            // variant exists on every supported SDK, so use it unconditionally
+            // and convert the exception into an NSError.
             BOOL installed = NO;
-            if (@available(macOS 27.0, *)) {
-                installed = [input installTapOnBus:0 bufferSize:4096 format:nil error:&error block:tapBlock];
-            } else {
-                // macOS 26 exposes only the exception-throwing selector.
-                @try {
-                    [input installTapOnBus:0 bufferSize:4096 format:nil block:tapBlock];
-                    installed = YES;
-                } @catch (NSException *exception) {
-                    error = [NSError errorWithDomain:@"io.thehumanworks.screengrab.audio"
-                                                 code:1
-                                             userInfo:@{NSLocalizedDescriptionKey: exception.reason ?: @"could not install microphone tap"}];
-                }
+            @try {
+                [input installTapOnBus:0 bufferSize:4096 format:nil block:tapBlock];
+                installed = YES;
+            } @catch (NSException *exception) {
+                error = [NSError errorWithDomain:@"io.thehumanworks.screengrab.audio"
+                                             code:1
+                                         userInfo:@{NSLocalizedDescriptionKey: exception.reason ?: @"could not install microphone tap"}];
             }
             if (!installed) {
                 sg_audio_engine = nil;

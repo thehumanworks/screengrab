@@ -20,6 +20,23 @@ go build -o screengrab .
 
 The resulting `./screengrab` is a self-contained binary. On macOS arm64 it is around 3.5 MB.
 
+### Run straight from GitHub Releases
+
+Tagged releases (`v*`) publish prebuilt tarballs for macOS (arm64, x86_64) and
+Linux (x86_64) via `.github/workflows/release.yml`. Tools that install from
+GitHub release assets can run the binary without cloning or building, e.g.
+with [mise](https://mise.jdx.dev):
+
+```sh
+mise x github:thehumanworks/screengrab -- screengrab --help
+
+# pin a specific release
+mise x github:thehumanworks/screengrab@v0.1.0 -- screengrab --duration 10s --output capture
+```
+
+Each asset is a `.tar.gz` named `screengrab-<tag>-<os>-<arch>.tar.gz` with the
+`screengrab` binary at its root, plus a `checksums.txt` with SHA-256 sums.
+
 ## Quick start
 
 ```sh
